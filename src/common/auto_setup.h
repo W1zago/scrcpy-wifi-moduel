@@ -1,0 +1,389 @@
+#pragma once
+/**
+ * auto_setup.h — Автоввід всіх системних команд (щоб користувач нічого не вводив вручну)
+ *
+ * Використовується обома бінарниками:
+ *  - agent_receiver --auto  : сам робить adb start-server, перевіряє vhci, запускає scrcpy
+ *  - agent_sender --auto    : сам робить adb tcpip 5555, визначає IP телефону, робить adb connect
+ *
+ * Header-only, без зовнішніх залежностей, тільки STL + Win32 API.
+ * Всі функції логують команду ПЕРЕД виконанням: [AUTO] $ <cmd>
+ */
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <array>
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <windows.h>
+#else
+  #include <unistd.h>
+#endif
+
+namespace autosetup {
+
+// ============================================================================
+// Базовий запуск команди з захопленням виводу
+// ============================================================================
+
+struct ExecResult {
+    int exit_code = -1;
+    std::string output;   // stdout+stderr
+    bool ok() const { return exit_code == 0; }
+};
+
+inline void LogCmd(const std::string& cmd) {
+    printf("[AUTO] $ %s\n", cmd.c_str());
+    fflush(stdout);
+}
+
+// Виконати команду, повернути код + вивід. timeout_ms поки ігнорується (для PoC).
+inline ExecResult Exec(const std::string& cmd, bool silent = false) {
+    if (!silent) LogCmd(cmd);
+#ifdef _WIN32
+    FILE* pipe = _popen((cmd + " 2>&1").c_str(), "r");
+#else
+    FILE* pipe = popen((cmd + " 2>&1").c_str(), "r");
+#endif
+    ExecResult r;
+    if (!pipe) {
+        r.exit_code = -1;
+        r.output = "<popen failed>";
+        return r;
+    }
+    std::array<char, 4096> buf{};
+    std::string out;
+    while (fgets(buf.data(), (int)buf.size(), pipe)) {
+        out += buf.data();
+    }
+#ifdef _WIN32
+    r.exit_code = _pclose(pipe);
+#else
+    r.exit_code = pclose(pipe);
+#endif
+    r.output = out;
+    if (!silent && !out.empty()) {
+        // Показуємо перші ~2000 символів, щоб лог не роздувало
+        printf("[AUTO]   | %s%s", out.substr(0, 2000).c_str(), out.size() > 2000 ? "...\n" : "");
+        fflush(stdout);
+    }
+    return r;
+}
+
+// Запуск без очікування (detached), для scrcpy / adb daemon
+inline bool LaunchDetached(const std::string& cmd) {
+    LogCmd(cmd + "  (& detached)");
+#ifdef _WIN32
+    // "start /min" щоб не блокувати консоль
+    std::string full = "start \"\" /min " + cmd;
+    int rc = system(full.c_str());
+    return rc == 0;
+#else
+    std::string full = cmd + " &";
+    int rc = system(full.c_str());
+    return rc == 0;
+#endif
+}
+
+inline bool CommandExists(const std::string& tool) {
+#ifdef _WIN32
+    ExecResult r = Exec("where " + tool, true);
+    return r.ok() && !r.output.empty();
+#else
+    ExecResult r = Exec("which " + tool, true);
+    return r.ok() && !r.output.empty();
+#endif
+}
+
+inline bool IsAdmin() {
+#ifdef _WIN32
+    BOOL is_admin = FALSE;
+    PSID admin_group = nullptr;
+    SID_IDENTIFIER_AUTHORITY nt_auth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&nt_auth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admin_group)) {
+        CheckTokenMembership(nullptr, admin_group, &is_admin);
+        FreeSid(admin_group);
+    }
+    return is_admin == TRUE;
+#else
+    return geteuid() == 0;
+#endif
+}
+
+// ============================================================================
+// ADB автоматизація
+// ============================================================================
+
+struct AdbDevice {
+    std::string serial;     // напр. "192.168.1.100:5555" або "R5CRxxx"
+    std::string state;      // device / offline / unauthorized
+    std::string transport;  // usb / tcp / unknown (парсимо з -l)
+    bool is_tcp() const { return serial.find(':') != std::string::npos; }
+};
+
+inline std::vector<AdbDevice> AdbDevices() {
+    std::vector<AdbDevice> out;
+    ExecResult r = Exec("adb devices -l", true);
+    if (!r.ok()) return out;
+    // Формат:
+    // List of devices attached
+    // R5CR11XXXX	device product:... model:... transport:usb
+    // 192.168.1.100:5555	device product:... transport:tcp
+    char* ctx = nullptr;
+#ifdef _WIN32
+    // strtok_s на Windows
+    std::string copy = r.output;
+    // Розбиваємо по рядках вручну щоб не залежати від strtok
+    size_t pos = 0;
+    std::vector<std::string> lines;
+    while (pos < copy.size()) {
+        size_t nl = copy.find('\n', pos);
+        std::string line = copy.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        lines.push_back(line);
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+#else
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos < r.output.size()) {
+        size_t nl = r.output.find('\n', pos);
+        lines.push_back(r.output.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+#endif
+    (void)ctx;
+    for (auto& line : lines) {
+        // Пропускаємо заголовок і порожні
+        if (line.find("List of devices") != std::string::npos) continue;
+        if (line.empty()) continue;
+        // Шукаємо таб або пробіли: "<serial>\t<state>"
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) tab = line.find(' ');
+        if (tab == std::string::npos) continue;
+        std::string serial = line.substr(0, tab);
+        // trim
+        while (!serial.empty() && (serial.back() == ' ' || serial.back() == '\r' || serial.back() == '\t')) serial.pop_back();
+        while (!serial.empty() && (serial.front() == ' ' || serial.front() == '\t')) serial.erase(serial.begin());
+        if (serial.empty()) continue;
+        std::string rest = line.substr(tab + 1);
+        std::string state = "unknown";
+        if (rest.find("device") != std::string::npos && rest.find("offline") == std::string::npos) state = "device";
+        else if (rest.find("offline") != std::string::npos) state = "offline";
+        else if (rest.find("unauthorized") != std::string::npos) state = "unauthorized";
+        std::string transport = "unknown";
+        auto tp = rest.find("transport:");
+        if (tp != std::string::npos) {
+            size_t s = tp + 10;
+            size_t e = rest.find(' ', s);
+            transport = rest.substr(s, e == std::string::npos ? std::string::npos : e - s);
+            while (!transport.empty() && (transport.back() == '\r' || transport.back() == ' ')) transport.pop_back();
+        } else if (serial.find(':') != std::string::npos) {
+            transport = "tcp";
+        }
+        out.push_back({serial, state, transport});
+    }
+    return out;
+}
+
+inline void PrintAdbDevices() {
+    auto devs = AdbDevices();
+    printf("[AUTO] adb devices: %zu found\n", devs.size());
+    for (auto& d : devs) {
+        printf("[AUTO]   - %s  state=%s transport=%s\n", d.serial.c_str(), d.state.c_str(), d.transport.c_str());
+    }
+    if (devs.empty()) {
+        printf("[AUTO]   (порожньо — телефон не підключено по USB і не законекчено по Wi-Fi)\n");
+    }
+}
+
+// adb start-server (завжди безпечно викликати)
+inline bool EnsureAdbServer() {
+    if (!CommandExists("adb")) {
+        printf("[AUTO] ERROR: 'adb' не знайдено в PATH.\n");
+        printf("[AUTO] Встановіть: winget install Google.PlatformTools\n");
+        return false;
+    }
+    ExecResult r = Exec("adb start-server");
+    return r.ok();
+}
+
+// adb tcpip <port> — перемикає USB-підключений телефон в TCP режим
+inline bool AdbTcpip(int port = 5555) {
+    ExecResult r = Exec("adb tcpip " + std::to_string(port));
+    if (!r.ok()) {
+        printf("[AUTO] adb tcpip не вдався. Можливо телефон не підключено по USB або не підтверджено RSA.\n");
+        return false;
+    }
+    printf("[AUTO] Телефон переведено в tcpip :%d. Зачекайте 2с...\n", port);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    return true;
+}
+
+// Спробувати визначити IP телефону через adb shell
+inline std::string DetectPhoneIp() {
+    // Спосіб 1: ip route (працює на більшості)
+    {
+        ExecResult r = Exec("adb shell ip route", true);
+        // шукаємо "src 192.168.x.x"
+        auto p = r.output.find("src ");
+        if (p != std::string::npos) {
+            size_t s = p + 4;
+            size_t e = r.output.find(' ', s);
+            std::string ip = r.output.substr(s, e == std::string::npos ? std::string::npos : e - s);
+            while (!ip.empty() && (ip.back() == '\r' || ip.back() == '\n' || ip.back() == ' ')) ip.pop_back();
+            if (!ip.empty() && ip.find('.') != std::string::npos) {
+                printf("[AUTO] IP телефону (ip route): %s\n", ip.c_str());
+                return ip;
+            }
+        }
+    }
+    // Спосіб 2: ip addr show wlan0
+    {
+        ExecResult r = Exec("adb shell ip addr show wlan0", true);
+        auto p = r.output.find("inet ");
+        if (p != std::string::npos) {
+            size_t s = p + 5;
+            size_t e = r.output.find('/', s);
+            std::string ip = r.output.substr(s, e == std::string::npos ? std::string::npos : e - s);
+            while (!ip.empty() && (ip.back() == '\r' || ip.back() == '\n' || ip.back() == ' ')) ip.pop_back();
+            if (!ip.empty() && ip.find('.') != std::string::npos) {
+                printf("[AUTO] IP телефону (wlan0): %s\n", ip.c_str());
+                return ip;
+            }
+        }
+    }
+    return "";
+}
+
+inline bool AdbConnect(const std::string& ip, int port = 5555) {
+    ExecResult r = Exec("adb connect " + ip + ":" + std::to_string(port));
+    // adb connect повертає 0 навіть при "failed", тому перевіряємо вивід
+    if (r.output.find("connected") != std::string::npos || r.output.find("already") != std::string::npos) {
+        printf("[AUTO] adb connect OK: %s:%d\n", ip.c_str(), port);
+        return true;
+    }
+    printf("[AUTO] adb connect НЕ вдався. Перевірте що телефон і ПК в одній Wi-Fi мережі.\n");
+    return false;
+}
+
+// Повний ланцюжок: USB -> tcpip -> detect IP -> connect. Повертає "ip:port" або "".
+inline std::string AutoSetupPhoneWifi(int port = 5555) {
+    EnsureAdbServer();
+    auto devs = AdbDevices();
+    // Якщо вже є TCP пристрій в стані device — нічого не робимо
+    for (auto& d : devs) {
+        if (d.is_tcp() && d.state == "device") {
+            printf("[AUTO] Вже є Wi-Fi пристрій: %s — пропускаємо tcpip.\n", d.serial.c_str());
+            return d.serial;
+        }
+    }
+    // Чи є USB пристрій?
+    bool has_usb = false;
+    for (auto& d : devs) {
+        if (!d.is_tcp() && d.state == "device") { has_usb = true; break; }
+    }
+    if (!has_usb) {
+        printf("[AUTO] USB-пристрій не знайдено. Пропускаємо tcpip (можливо вже в tcpip або потрібен --phone-ip).\n");
+        return "";
+    }
+    printf("[AUTO] Знайдено USB-пристрій, перемикаємо в Wi-Fi (tcpip %d)...\n", port);
+    if (!AdbTcpip(port)) return "";
+    std::string ip = DetectPhoneIp();
+    if (ip.empty()) {
+        printf("[AUTO] Не вдалося визначити IP. Введіть вручну або передайте --phone-ip.\n");
+        return "";
+    }
+    if (!AdbConnect(ip, port)) return "";
+    return ip + ":" + std::to_string(port);
+}
+
+// ============================================================================
+// VHCI / драйвер
+// ============================================================================
+
+inline bool CheckVhciPresent() {
+#ifdef _WIN32
+    // Спосіб 1: спроба відкрити пристрій
+    HANDLE h = CreateFileW(L"\\\\.\\vhci", GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        printf("[AUTO] VHCI драйвер знайдено (\\\\.\\vhci).\n");
+        return true;
+    }
+    HANDLE h2 = CreateFileW(L"\\\\.\\USBIP_VHCI", GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+    if (h2 != INVALID_HANDLE_VALUE) {
+        CloseHandle(h2);
+        printf("[AUTO] VHCI драйвер знайдено (\\\\.\\USBIP_VHCI).\n");
+        return true;
+    }
+    printf("[AUTO] VHCI драйвер НЕ знайдено. Працюємо в SIMULATION режимі.\n");
+    printf("[AUTO] Для справжнього USB: встановіть usbip-win2 (див. scripts/setup_windows.ps1) і запустіть з --vhci\n");
+    return false;
+#else
+    ExecResult r = Exec("ls /dev/vhci 2>&1", true);
+    return r.ok();
+#endif
+}
+
+inline void CheckTestSigning() {
+#ifdef _WIN32
+    ExecResult r = Exec("bcdedit /enum {current} | findstr testsigning", true);
+    if (r.output.find("Yes") != std::string::npos || r.output.find("testsigning          Yes") != std::string::npos) {
+        printf("[AUTO] Test Signing: ON.\n");
+    } else {
+        printf("[AUTO] Test Signing: OFF або невідомо (потрібно для usbip-win2 без EV-сертифіката).\n");
+        printf("[AUTO] Увімкнути (потрібні права адміна): bcdedit /set testsigning on  + перезавантаження\n");
+    }
+#endif
+}
+
+// ============================================================================
+// scrcpy
+// ============================================================================
+
+inline bool CheckScrcpy() {
+    if (!CommandExists("scrcpy")) {
+        printf("[AUTO] 'scrcpy' не знайдено в PATH. Встановіть: winget install Genymobile.scrcpy\n");
+        return false;
+    }
+    Exec("scrcpy --version", true);
+    return true;
+}
+
+// Запустити scrcpy автоматично (після того як пристрій готовий)
+inline bool LaunchScrcpy(const std::string& extra_args = "--select-usb") {
+    if (!CheckScrcpy()) return false;
+    std::string cmd = "scrcpy " + extra_args;
+    printf("[AUTO] Запускаємо scrcpy автоматично...\n");
+    return LaunchDetached(cmd);
+}
+
+// ============================================================================
+// Збірка
+// ============================================================================
+
+inline bool CheckCmake() {
+    if (!CommandExists("cmake")) {
+        printf("[AUTO] 'cmake' не знайдено. Встановіть: winget install Kitware.CMake\n");
+        return false;
+    }
+    return true;
+}
+
+} // namespace autosetup
