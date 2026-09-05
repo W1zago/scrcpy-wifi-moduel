@@ -18,11 +18,37 @@ START.bat real           # вимагає телефон (помилка якщ�
 python tools/auto_run.py                       # = START.bat
 python tools/auto_run.py --mode demo           # без телефону
 python tools/auto_run.py --mode real --phone-ip 192.168.1.100  # телефон за IP
-python tools/auto_run.py --check               # тільки перевірка залежностей
+python tools/auto_run.py --check               # тільки перевірка залежностей (+ компілятор)
 python tools/auto_run.py --dry-run             # тільки показати команди, нічого не запускати
+python tools/auto_run.py --install-deps        # самому доустановити cmake/adb/scrcpy через winget
 python tools/auto_run.py --with-vhci           # спробувати справжній vhci.sys
 python tools/auto_run.py --no-scrcpy           # не запускати scrcpy автоматично
+START.bat install                              # те саме що --install-deps (подвійний клік)
 ```
+
+Автопілот запам'ятовує останній робочий пристрій у `build/last_phone.txt`. Якщо телефон
+завис у `tcpip`-режимі з минулого запуску (USB порожній), скрипт сам пробує `adb reconnect`
+і перепідключення до запам'ятованого IP — кабель смикати не треба.
+
+### Якщо `adb connect` не проходить (таймаут 10060)
+
+Автопілот сам: визначає IP **до** `adb tcpip` (поки USB живий), збирає всіх кандидатів
+(спочатку `wlan0`, потім `src` з route), кожного перевіряє 3 рази і друкує діагностику.
+Якщо `adb devices` порожній — сам пробує `adb reconnect` і останній запам'ятований IP.
+Найчастіші причини:
+
+1. Телефон НЕ в тій самій Wi-Fi мережі, що ПК (IP на кшталт `10.x` — це мобільні дані, а не LAN).
+   Увімкніть Wi-Fi на телефоні і підключіться до того ж роутера.
+2. Вимкнене *Бездротове налагодження* (Параметри → Для розробників).
+3. AP isolation в роутері / брандмауер Windows ріже порт 5555 (`ping <IP>` для перевірки).
+4. IP не визначився сам — задайте вручну: `--phone-ip <IP з Налаштування → Про телефон → Статус>`.
+
+### Для збірки C++ потрібні (одноразово)
+
+- `winget install Kitware.CMake` (або `--install-deps`)
+- Компілятор MSVC (3–8 ГБ, 10–30 хв, одноразово):
+  `winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
+- `python tools/auto_run.py --check` покаже чого не вистачає.
 
 Що автопілот робить САМ, по кроках:
 
@@ -31,7 +57,8 @@ python tools/auto_run.py --no-scrcpy           # не запускати scrcpy 
 | 0 | Перевірка `adb`, `scrcpy`, `cmake` (підказує `winget install ...` якщо нема) |
 | 1 | `adb start-server` |
 | 2 | `adb devices -l` → якщо USB: `adb tcpip 5555` → `adb shell ip route` (IP) → `adb connect IP:5555` |
-| 3 | `cmake -B build` + `cmake --build build --config Release` (якщо бінарників нема) |
+| 3 | `cmake -B build` + `cmake --build build --config Release` (якщо бінарників нема; cmake доустановить сам через winget, може попросити UAC). Без компілятора MSVC — чесна помилка + інструкція |
+| 3b | **Fallback**: якщо зібрати нема чим, а телефон вже по Wi-Fi в `device` — запускає звичайний `scrcpy -s IP:5555` по TCP (не віртуальний USB, але дзеркало працює одразу) |
 | 4 | Запуск `agent_sender` (з `--simulate-adb` в демо, з `--auto` для реального телефону) |
 | 5 | Запуск `agent_receiver --auto` (сам робить `adb devices`, перевіряє VHCI) |
 | 6 | Пауза + контрольний `adb devices` |
@@ -57,7 +84,9 @@ powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1
 #      скачування+встановлення usbip-win2, adb start-server + adb devices
 ```
 
-> **Примітка:** `scripts/setup_windows.ps1` має лишатись у кодуванні **UTF-8 with BOM** (інакше PowerShell 5.1 ламається на кирилиці).
+> **Примітки про кодування (важливо, інакше вікно блимає і гасне):**
+> - `scripts/setup_windows.ps1` має лишатись у кодуванні **UTF-8 with BOM + CRLF** (інакше PowerShell 5.1 ламається на кирилиці).
+> - `START.bat` має лишатись **чистим ASCII + CRLF, без кирилиці** (інакше cmd.exe розриває рядки і вікно закривається за секунду). Весь український текст — тільки в `tools/auto_run.py`.
 
 ## Ручний режим (якщо треба покроково)
 

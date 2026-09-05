@@ -182,6 +182,8 @@ inline std::vector<AdbDevice> AdbDevices() {
         if (rest.find("device") != std::string::npos && rest.find("offline") == std::string::npos) state = "device";
         else if (rest.find("offline") != std::string::npos) state = "offline";
         else if (rest.find("unauthorized") != std::string::npos) state = "unauthorized";
+        // Серійник без ":" і без поля transport: — це фізичний USB
+        // (старі adb не пишуть transport: взагалі).
         std::string transport = "unknown";
         auto tp = rest.find("transport:");
         if (tp != std::string::npos) {
@@ -191,6 +193,8 @@ inline std::vector<AdbDevice> AdbDevices() {
             while (!transport.empty() && (transport.back() == '\r' || transport.back() == ' ')) transport.pop_back();
         } else if (serial.find(':') != std::string::npos) {
             transport = "tcp";
+        } else {
+            transport = "usb";
         }
         out.push_back({serial, state, transport});
     }
@@ -219,66 +223,117 @@ inline bool EnsureAdbServer() {
     return r.ok();
 }
 
-// adb tcpip <port> — перемикає USB-підключений телефон в TCP режим
+// adb tcpip <port> — перемикає USB-підключений телефон в TCP режим.
+// УВАГА: після цієї команди USB-лінк вмирає (adbd рестартиться), тому IP
+// телефону треба визначити ЗАРАЗ — до виклику (див. AutoSetupPhoneWifi).
 inline bool AdbTcpip(int port = 5555) {
     ExecResult r = Exec("adb tcpip " + std::to_string(port));
     if (!r.ok()) {
         printf("[AUTO] adb tcpip не вдався. Можливо телефон не підключено по USB або не підтверджено RSA.\n");
         return false;
     }
-    printf("[AUTO] Телефон переведено в tcpip :%d. Зачекайте 2с...\n", port);
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // adbd рестартиться 3-5с — чекаємо довше (2с замало, connect висів до таймауту)
+    printf("[AUTO] Телефон переведено в tcpip :%d. Чекаю 4с поки adbd перезапуститься...\n", port);
+    std::this_thread::sleep_for(std::chrono::seconds(4));
     return true;
 }
 
-// Спробувати визначити IP телефону через adb shell
-inline std::string DetectPhoneIp() {
-    // Спосіб 1: ip route (працює на більшості)
-    {
-        ExecResult r = Exec("adb shell ip route", true);
-        // шукаємо "src 192.168.x.x"
-        auto p = r.output.find("src ");
-        if (p != std::string::npos) {
-            size_t s = p + 4;
-            size_t e = r.output.find(' ', s);
-            std::string ip = r.output.substr(s, e == std::string::npos ? std::string::npos : e - s);
-            while (!ip.empty() && (ip.back() == '\r' || ip.back() == '\n' || ip.back() == ' ')) ip.pop_back();
-            if (!ip.empty() && ip.find('.') != std::string::npos) {
-                printf("[AUTO] IP телефону (ip route): %s\n", ip.c_str());
-                return ip;
-            }
-        }
-    }
-    // Спосіб 2: ip addr show wlan0
+inline bool IsUsableLanIp(const std::string& ip) {
+    if (ip.compare(0, 4, "127.") == 0) return false;
+    if (ip.compare(0, 8, "169.254.") == 0) return false;
+    return ip.find('.') != std::string::npos;
+}
+
+// Зібрати ВСІ кандидати на IP (спочатку wlan0, потім src з route).
+// Викликати ДО 'adb tcpip', поки USB живий!
+inline std::vector<std::string> DetectPhoneIps() {
+    std::vector<std::string> out;
+    auto push = [&](const std::string& ip) {
+        if (!IsUsableLanIp(ip)) return;
+        for (auto& e : out) if (e == ip) return;
+        out.push_back(ip);
+    };
+    // Спосіб 1: всі inet з wlan0 (найнадійніше — реальний Wi-Fi адрес)
     {
         ExecResult r = Exec("adb shell ip addr show wlan0", true);
-        auto p = r.output.find("inet ");
-        if (p != std::string::npos) {
-            size_t s = p + 5;
+        size_t pos = 0;
+        while ((pos = r.output.find("inet ", pos)) != std::string::npos) {
+            size_t s = pos + 5;
             size_t e = r.output.find('/', s);
             std::string ip = r.output.substr(s, e == std::string::npos ? std::string::npos : e - s);
             while (!ip.empty() && (ip.back() == '\r' || ip.back() == '\n' || ip.back() == ' ')) ip.pop_back();
-            if (!ip.empty() && ip.find('.') != std::string::npos) {
-                printf("[AUTO] IP телефону (wlan0): %s\n", ip.c_str());
-                return ip;
-            }
+            push(ip);
+            pos = s;
         }
     }
-    return "";
+    // Спосіб 2: всі src з ip route
+    {
+        ExecResult r = Exec("adb shell ip route", true);
+        size_t pos = 0;
+        while ((pos = r.output.find("src ", pos)) != std::string::npos) {
+            size_t s = pos + 4;
+            size_t e = r.output.find_first_of(" \r\n", s);
+            std::string ip = r.output.substr(s, e == std::string::npos ? std::string::npos : e - s);
+            push(ip);
+            pos = s;
+        }
+    }
+    if (!out.empty()) {
+        printf("[AUTO] Кандидати на IP телефону:");
+        for (auto& ip : out) printf(" %s", ip.c_str());
+        printf("\n");
+    }
+    return out;
 }
 
-inline bool AdbConnect(const std::string& ip, int port = 5555) {
-    ExecResult r = Exec("adb connect " + ip + ":" + std::to_string(port));
-    // adb connect повертає 0 навіть при "failed", тому перевіряємо вивід
-    if (r.output.find("connected") != std::string::npos || r.output.find("already") != std::string::npos) {
-        printf("[AUTO] adb connect OK: %s:%d\n", ip.c_str(), port);
-        return true;
+// Сумісність: перший кандидат або "".
+inline std::string DetectPhoneIp() {
+    auto v = DetectPhoneIps();
+    return v.empty() ? "" : v[0];
+}
+
+inline bool TcpDeviceReady(const std::string& serial) {
+    auto devs = AdbDevices();
+    std::string want_ip = serial.substr(0, serial.find(':'));
+    for (auto& d : devs) {
+        if (d.serial == serial && d.state == "device") return true;
+        if (d.serial.compare(0, want_ip.size(), want_ip) == 0 &&
+            d.state == "device" && d.is_tcp()) return true;
     }
-    printf("[AUTO] adb connect НЕ вдався. Перевірте що телефон і ПК в одній Wi-Fi мережі.\n");
     return false;
 }
 
-// Повний ланцюжок: USB -> tcpip -> detect IP -> connect. Повертає "ip:port" або "".
+// adb connect + ПЕРЕВІРКА що пристрій реально в стані device (з ретраями,
+// бо adbd після tcpip рестартиться кілька секунд і перший connect часто падає).
+inline bool AdbConnect(const std::string& ip, int port = 5555, int attempts = 3) {
+    std::string serial = ip + ":" + std::to_string(port);
+    for (int i = 1; i <= attempts; ++i) {
+        printf("[AUTO] Спроба %d/%d: adb connect %s ...\n", i, attempts, serial.c_str());
+        Exec("adb connect " + serial);
+        for (int w = 0; w < 4; ++w) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (TcpDeviceReady(serial)) {
+                printf("[AUTO] Підключено і підтверджено: %s (device).\n", serial.c_str());
+                return true;
+            }
+        }
+    }
+    printf("[AUTO] Не вдалося отримати device на %s за %d спроби.\n", serial.c_str(), attempts);
+    return false;
+}
+
+inline void DiagnoseConnectFail(const std::string& ip, int port) {
+    printf("\n[AUTO] ДІАГНОСТИКА: adb connect не вдався. Перевірте по пунктах:\n");
+    printf("[AUTO]   1. Телефон і ПК в ОДНІЙ Wi-Fi мережі? (IP %s має бути з вашої LAN, напр. 192.168.x.x)\n", ip.c_str());
+    printf("[AUTO]      Якщо IP схоже на мобільну підмережу (10.x) — увімкніть Wi-Fi на телефоні.\n");
+    printf("[AUTO]   2. На телефоні: Параметри -> Для розробників -> Бездротове налагодження УВІМКНЕНО?\n");
+    printf("[AUTO]   3. AP isolation в роутері вимкнено?\n");
+    printf("[AUTO]   4. Брандмауер Windows не ріже порт %d? Тест: ping %s\n", port, ip.c_str());
+    printf("[AUTO]   5. Або задайте IP вручну: --phone-ip <IP з Налаштування -> Про телефон -> Статус>\n\n");
+}
+
+// Повний ланцюжок: detect IP (поки USB живий!) -> tcpip -> connect з verify.
+// Повертає "ip:port" або "".
 inline std::string AutoSetupPhoneWifi(int port = 5555) {
     EnsureAdbServer();
     auto devs = AdbDevices();
@@ -298,15 +353,26 @@ inline std::string AutoSetupPhoneWifi(int port = 5555) {
         printf("[AUTO] USB-пристрій не знайдено. Пропускаємо tcpip (можливо вже в tcpip або потрібен --phone-ip).\n");
         return "";
     }
+    // КРОК 1: IP — ДО tcpip, поки USB живий (після рестарту adbd 'adb shell' вже не працює
+    // і можна схопити сміття на кшталт шлюзу мобільної підмережі).
+    printf("[AUTO] Визначаю IP телефону ДО перезапуску adbd (поки USB живий)...\n");
+    auto candidates = DetectPhoneIps();
     printf("[AUTO] Знайдено USB-пристрій, перемикаємо в Wi-Fi (tcpip %d)...\n", port);
     if (!AdbTcpip(port)) return "";
-    std::string ip = DetectPhoneIp();
-    if (ip.empty()) {
+    if (candidates.empty()) {
+        printf("[AUTO] До tcpip IP не визначився — пробую ще раз (може не вийти, USB вже мертвий)...\n");
+        candidates = DetectPhoneIps();
+    }
+    if (candidates.empty()) {
         printf("[AUTO] Не вдалося визначити IP. Введіть вручну або передайте --phone-ip.\n");
         return "";
     }
-    if (!AdbConnect(ip, port)) return "";
-    return ip + ":" + std::to_string(port);
+    // КРОК 2: пробуємо КОЖНОГО кандидата з перевіркою
+    for (auto& ip : candidates) {
+        if (AdbConnect(ip, port)) return ip + ":" + std::to_string(port);
+    }
+    DiagnoseConnectFail(candidates[0], port);
+    return "";
 }
 
 // ============================================================================
