@@ -23,7 +23,18 @@ auto_run.py — ОДНА команда замість всіх ручних к�
   [2] Пошук телефону: adb devices
       - якщо є USB device  -> adb tcpip 5555 -> визначення IP -> adb connect IP:5555
       - якщо є TCP device  -> використовуємо як є
-      - якщо нема нічого   -> демо-режим (fake adbd)
+      - якщо кабелю НЕМА   -> вискакує ВІКНО зі знайденими телефонами (як Bluetooth):
+        скан у фоні, список поповнюється наживо, клік → підключення, код
+        парування — в тому ж вікні. БЕЗ КАБЕЛЮ через Бездротове налагодження
+        (Android 11+): знаходить телефон сам по mDNS, просить тільки код з екрану
+        (adb pair), потім adb connect на динамічний порт. Кабель взагалі не потрібен!
+      - якщо нічого не знайдено -> СКАНУЄ всю локальну мережу (порт 5555), показує
+        список "IP — назва пристрою" (ro.product.model) і пропонує вибрати номер
+      - якщо в мережі порожньо -> демо-режим (fake adbd)
+      Прапорці: --scan (примусовий скан), --no-scan (без скану 5555),
+                --no-wireless (без безкабельного етапу), --pair-code <код>,
+                --pick <N|IP> (автовибір без запиту, без вікна), --scan-timeout <сек>,
+                --mdns-timeout <сек>, --gui (примусово вікно), --no-gui (тільки консоль)
   [3] Збірка (cmake) якщо бінарників нема (можна пропустити --skip-build)
   [4] Запуск agent_sender (підпроцес, лог з префіксом [SENDER])
   [5] Запуск agent_receiver --auto (підпроцес, [RECEIVER]) — він САМ зробить
@@ -36,10 +47,13 @@ auto_run.py — ОДНА команда замість всіх ручних к�
 """
 
 import argparse
+import concurrent.futures
+import ipaddress
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -262,14 +276,30 @@ def adb_connect_verify(ip, adb_port, attempts=3):
     for i in range(1, attempts + 1):
         log(f"Спроба {i}/{attempts}: adb connect {serial} ...")
         run(["adb", "connect", serial], timeout=30)
-        # даємо adbd секунду-дві на handshake (A_CNXN)
-        for _ in range(4):
-            time.sleep(1)
+        # даємо adbd час на handshake (A_CNXN); опитуємо кожні 0.5с щоб не чекати зайвого
+        for _ in range(8):
+            time.sleep(0.5)
             if _tcp_device_ready(serial, adb_port):
                 log(f"Підключено і підтверджено: {serial} (device).")
                 return True
         log(f"Поки не device, пробую ще...")
     log(f"Не вдалося отримати device на {serial} за {attempts} спроби.")
+    return False
+
+def adb_connect_fast(ip, adb_port, timeout=5.0):
+    """Швидкий connect для ВІДОМИХ/знайдених пристроїв: один adb connect + опитування.
+
+    На відміну від adb_connect_verify (довгі ретраї для adbd що рестартиться після
+    tcpip) — повертається за ~1-2с коли все добре, і не висить коли погано.
+    """
+    serial = f"{ip}:{adb_port}"
+    run(["adb", "connect", serial], timeout=15)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if _tcp_device_ready(serial, adb_port):
+            log(f"Підключено: {serial} (device).")
+            return True
+        time.sleep(0.5)
     return False
 
 def diagnose_connect_fail(ip, adb_port):
@@ -302,52 +332,1672 @@ def load_last_phone():
         pass
     return ""
 
-def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None):
-    """Повний ланцюжок USB->tcpip->connect. Повертає (adb_host, demo_needed)."""
+
+# ---------------- сканування LAN: всі доступні IP + назви пристроїв ----------------
+
+def _prefix_from_netmask(mask_str):
+    """'255.255.255.0' -> 24. Повертає 24 якщо розпарсити не вдалося."""
+    try:
+        return ipaddress.IPv4Network(f"0.0.0.0/{mask_str.strip()}").prefixlen
+    except Exception:
+        return 24
+
+
+def get_local_subnets(first_ip=None):
+    """Визначити локальні підмережі ПК. Повертає список IPv4Network.
+
+    Пробує: ipconfig (Windows) -> ip addr (Linux) -> fallback socket (/24).
+    Великі мережі (префікс < 24) обрізаємо до /24 навколо власного IP,
+    щоб сканування займало секунди, а не години.
+    first_ip: якщо задано — підмережа з цим IP йде ПЕРШОЮ (там найімовірніше телефон).
+    """
+    found = []  # список (ip_str, prefix)
+
+    def add(ip_str, prefix):
+        try:
+            ip = ipaddress.ip_address(ip_str.strip())
+            if not isinstance(ip, ipaddress.IPv4Address):
+                return
+            if ip.is_loopback or ip.is_link_local:
+                return
+            if ip_str.strip().startswith("169.254."):
+                return
+            prefix = max(0, min(32, int(prefix)))
+            found.append((str(ip), prefix))
+        except Exception:
+            pass
+
+    # Windows: ipconfig (мовно-незалежно: IP-рядок -> найближчий рядок з маскою 255.x).
+    # Мітки ipconfig локалізовані (Subnet Mask / Маска подсети / Маска підмережі) і йдуть
+    # в OEM-кодуванні, тому покладаємось тільки на ASCII-ознаки: "IPv4" і "255.".
+    if os.name == "nt":
+        try:
+            r = subprocess.run(["ipconfig"], capture_output=True, text=True,
+                               timeout=15, encoding="utf-8", errors="replace")
+            out = r.stdout or ""
+            cur_ip = ""
+            for line in out.splitlines():
+                ips_in_line = re.findall(r"(\d+\.\d+\.\d+\.\d+)", line)
+                if not ips_in_line:
+                    continue
+                masks = [ip for ip in ips_in_line if ip.startswith("255.")]
+                if masks and cur_ip:
+                    # Рядок з маскою — паруємо з останнім побаченим IP
+                    add(cur_ip, _prefix_from_netmask(masks[0]))
+                    cur_ip = ""
+                    continue
+                # Рядок з адресою інтерфейсу: містить "IPv4" (є і в EN, і в RU/UA "IPv4-адрес").
+                # DNS-шлюзи не чіпаємо — вони без мітки IPv4.
+                if re.search(r"IPv4", line, re.IGNORECASE):
+                    for ip in ips_in_line:
+                        if not ip.startswith("255.") and _is_usable_lan(ip):
+                            cur_ip = ip
+                            break
+                    continue
+            if cur_ip:
+                # Маски не знайшли (рідко) — беремо /24
+                add(cur_ip, 24)
+        except Exception:
+            pass
+    else:
+        # Linux: ip -4 addr show
+        for cmd in (["ip", "-4", "addr", "show"], ["ifconfig"]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=15, encoding="utf-8", errors="replace")
+                out = r.stdout or ""
+                for m in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", out):
+                    add(m.group(1), int(m.group(2)))
+                for m in re.finditer(r"inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+).*?(?:Mask|netmask)[:\s]+(\d+\.\d+\.\d+\.\d+)",
+                                     out, re.IGNORECASE):
+                    add(m.group(1), _prefix_from_netmask(m.group(2)))
+                if found:
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            except Exception:
+                continue
+
+    # Fallback: локальний IP через "з'єднання" на 8.8.8.8 (трафіку нема, тільки getsockname)
+    if not found:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            add(local_ip, 24)
+        except Exception:
+            pass
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                add(info[4][0], 24)
+        except Exception:
+            pass
+
+    nets = []
+    seen = set()
+    for ip_str, prefix in found:
+        try:
+            # Великі мережі сканувати цілком довго — беремо /24 навколо власного IP
+            eff_prefix = prefix if prefix >= 24 else 24
+            net = ipaddress.ip_network(f"{ip_str}/{eff_prefix}", strict=False)
+            if str(net) not in seen:
+                seen.add(str(net))
+                nets.append(net)
+        except Exception:
+            continue
+    if first_ip:
+        # Підмережа з останнім відомим IP телефону — першою (там він найімовірніше)
+        try:
+            fip = ipaddress.ip_address(first_ip.strip())
+            nets.sort(key=lambda n: (0 if fip in n else 1, str(n)))
+        except Exception:
+            pass
+    return nets
+
+
+def _tcp_port_open(ip, port, timeout):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def scan_lan_for_adb(adb_port=5555, timeout=0.45, workers=96, first_ip=None, on_found=None):
+    """Просканувати всі локальні підмережі, повернути сортированный список IP з відкритим adb-портом.
+
+    first_ip: підмережа з цим IP сканується першою. on_found(ip): колбек одразу як
+    знайдено відкритий порт (не чекаючи кінця скану — для живого оновлення списку).
+    """
+    nets = get_local_subnets(first_ip=first_ip)
+    if not nets:
+        log("LAN-сканування: не вдалося визначити локальну підмережу.")
+        return []
+    targets = []
+    for net in nets:
+        hosts = list(net.hosts())
+        # Захист від /22 і більше (хоч get_local_subnets вже ріже до /24, перестраховуємось)
+        if len(hosts) > 1024:
+            log(f"LAN-сканування: {net} завелика ({len(hosts)} адрес) — сканую перші 1024.")
+            hosts = hosts[:1024]
+        targets.extend(str(h) for h in hosts)
+    # Прибрати дублікати, зберегти порядок (пріоритетна підмережа — першою)
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        return []
+    log(f"Сканую мережу: {', '.join(str(n) for n in nets)} "
+        f"({len(targets)} адрес, порт {adb_port})... це займе кілька секунд.")
+    open_ips = []
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut2ip = {ex.submit(_tcp_port_open, ip, adb_port, timeout): ip for ip in targets}
+        for fut in concurrent.futures.as_completed(fut2ip):
+            try:
+                if fut.result():
+                    ip = fut2ip[fut]
+                    open_ips.append(ip)
+                    if on_found:
+                        try:
+                            on_found(ip)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    # Сортуємо як IP, не як рядки (щоб .100 не було перед .20)
+    try:
+        open_ips.sort(key=lambda s: tuple(int(p) for p in s.split(".")))
+    except Exception:
+        open_ips.sort()
+    dt = time.time() - t0
+    if open_ips:
+        log(f"Відкритий порт {adb_port} знайдено на: {', '.join(open_ips)} (скан {dt:.1f}с).")
+    else:
+        log(f"Нічого з відкритим портом {adb_port} не знайдено (скан {dt:.1f}с).")
+        log("Підказка: увімкніть на телефоні Бездротове налагодження або виконайте 'adb tcpip 5555' по USB.")
+    return open_ips
+
+
+def _adb_shell_on(serial, args, timeout=6):
+    """adb -s <serial> <args...> -> stdout або ''."""
+    try:
+        r = subprocess.run(["adb", "-s", serial] + args, capture_output=True,
+                           text=True, timeout=timeout, encoding="utf-8", errors="replace")
+        out = (r.stdout or "").strip()
+        if "no devices" in out or "device not found" in out or "device offline" in out:
+            return ""
+        if r.returncode != 0 and not out:
+            return ""
+        return out
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def get_device_info(ip, adb_port=5555):
+    """Підключитись до IP, прочитати назву. Повертає dict(ip, serial, name, model, ...)."""
+    serial = f"{ip}:{adb_port}"
+    # Один connect (без довгих ретраїв — ретраї будуть після вибору користувача)
+    try:
+        subprocess.run(["adb", "connect", serial], capture_output=True, text=True,
+                       timeout=20, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    time.sleep(0.5)
+    state = ""
+    for s, st, _t in adb_devices():
+        if s == serial or (s.split(":")[0] == ip and ":" in s):
+            state = st
+            serial = s  # adb міг показати інший порт — беремо реальний серійник
+            break
+    manufacturer = _adb_shell_on(serial, ["shell", "getprop", "ro.product.manufacturer"]) if state == "device" else ""
+    model = _adb_shell_on(serial, ["shell", "getprop", "ro.product.model"]) if state == "device" else ""
+    device = _adb_shell_on(serial, ["shell", "getprop", "ro.product.device"]) if state == "device" else ""
+    android = _adb_shell_on(serial, ["shell", "getprop", "ro.build.version.release"]) if state == "device" else ""
+    dev_name = _adb_shell_on(serial, ["shell", "settings", "get", "global", "device_name"]) if state == "device" else ""
+    if not manufacturer and not model:
+        # Запасний варіант: банер з adb devices -l (model:...)
+        try:
+            r = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True,
+                               timeout=10, encoding="utf-8", errors="replace")
+            for line in (r.stdout or "").splitlines():
+                if serial.split(":")[0] in line:
+                    m = re.search(r"model:(\S+)", line)
+                    if m:
+                        model = model or m.group(1)
+                    m2 = re.search(r"device:(\S+)", line)
+                    if m2:
+                        device = device or m2.group(1)
+        except Exception:
+            pass
+    if manufacturer or model:
+        name = f"{manufacturer} {model}".strip()
+    elif dev_name and dev_name not in ("null", ""):
+        name = dev_name
+    elif device:
+        name = device
+    elif model:
+        name = model
+    else:
+        name = "невідома модель"
+    if android:
+        name = f"{name} (Android {android})"
+    if state == "unauthorized":
+        name += " [потрібно підтвердити RSA на екрані]"
+    elif state == "offline":
+        name += " [offline]"
+    elif not state:
+        name += " [не відповідає на ADB — можливо не телефон]"
+    return {"ip": ip, "serial": serial, "name": name, "state": state,
+            "manufacturer": manufacturer, "model": model, "android": android}
+
+
+def scan_lan_with_names(adb_port=5555, timeout=0.45, on_found=None, first_ip=None,
+                        on_port_open=None):
+    """Скан LAN + назва кожного пристрою. Повертає список dict (див. get_device_info).
+
+    Назви читаються ПАРАЛЕЛЬНО (по ~2с на всі, а не по черзі). on_port_open(ip):
+    порт відкрився (назви ще нема). on_found(info): готова назва (одразу, не чекаючи інших).
+    """
+    def on_open(ip):
+        if on_port_open:
+            try:
+                on_port_open(ip)
+            except Exception:
+                pass
+
+    ips = scan_lan_for_adb(adb_port=adb_port, timeout=timeout,
+                           first_ip=first_ip, on_found=on_open)
+    if not ips:
+        return []
+    infos = []
+    lock = threading.Lock()
+
+    def resolve(ip):
+        info = get_device_info(ip, adb_port)
+        with lock:
+            infos.append(info)
+        log(f"  - {info['serial']} — {info['name']}")
+        if on_found:
+            try:
+                on_found(info)
+            except Exception:
+                pass
+        return info
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(resolve, ips))
+    try:
+        infos.sort(key=lambda d: tuple(int(p) for p in d["ip"].split(".")))
+    except Exception:
+        pass
+    return infos
+
+
+def interactive_pick_device(dev_infos, adb_port=5555, pick=None):
+    """Показати список і попросити вибрати. Повертає IP (або ''). Зайві підключення відключає."""
+    if not dev_infos:
+        return ""
+    log("")
+    log(f"Знайдено пристроїв у мережі: {len(dev_infos)}. До якого приєднатись?")
+    for i, d in enumerate(dev_infos, 1):
+        log(f"  {i}. {d['serial']} — {d['name']}")
+    log("  0. Пропустити (демо без телефону)")
+    log("")
+
+    def cleanup(keep_ip):
+        for d in dev_infos:
+            if d["ip"] != keep_ip:
+                try:
+                    subprocess.run(["adb", "disconnect", d["serial"]],
+                                   capture_output=True, timeout=10)
+                except Exception:
+                    pass
+
+    # Неінтерактивний вибір через --pick (номер або IP)
+    if pick:
+        p = str(pick).strip()
+        chosen = ""
+        if p.isdigit():
+            idx = int(p)
+            if 1 <= idx <= len(dev_infos):
+                chosen = dev_infos[idx - 1]["ip"]
+        else:
+            for d in dev_infos:
+                if d["ip"] == p or d["serial"] == p or p in d["serial"]:
+                    chosen = d["ip"]
+                    break
+        if chosen:
+            log(f"Автовибір (--pick {pick}): {chosen}.")
+            cleanup(chosen)
+            return chosen
+        log(f"--pick={pick} ні з чим не збігся, питаю вручну...")
+
+    # Один пристрій + неінтерактивний термінал (скрипт/CI) — беремо його мовчки
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        if len(dev_infos) == 1:
+            log(f"Неінтерактивний режим — беру єдиний пристрій {dev_infos[0]['ip']} автоматично.")
+            return dev_infos[0]["ip"]
+        log("Неінтерактивний режим і пристроїв кілька — беру перший зі станом device (якщо є).")
+        for d in dev_infos:
+            if d["state"] == "device":
+                cleanup(d["ip"])
+                return d["ip"]
+        return ""
+
+    # Інтерактивний вибір
+    try:
+        ans = input("Введіть номер (1-%d), IP, або 0/Enter щоб пропустити: " % len(dev_infos)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        log("Вибір скасовано.")
+        cleanup(None)
+        return ""
+    if not ans or ans == "0":
+        log("Пропущено за вибором користувача.")
+        cleanup(None)
+        return ""
+    if ans.isdigit():
+        idx = int(ans)
+        if 1 <= idx <= len(dev_infos):
+            chosen = dev_infos[idx - 1]["ip"]
+            log(f"Вибрано: {dev_infos[idx-1]['serial']} — {dev_infos[idx-1]['name']}.")
+            cleanup(chosen)
+            return chosen
+        log("Невірний номер — пропускаю.")
+        cleanup(None)
+        return ""
+    # Ввели IP або серійник вручну
+    for d in dev_infos:
+        if d["ip"] == ans or d["serial"] == ans:
+            log(f"Вибрано: {d['serial']} — {d['name']}.")
+            cleanup(d["ip"])
+            return d["ip"]
+    # Дозволяємо будь-який IP вручну (навіть якщо сканер його не бачив — порт міг відкритись пізніше)
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ans):
+        log(f"Введено IP вручну: {ans} (його не було в скані, спробую підключитись).")
+        cleanup(None)
+        return ans
+    log("Незрозумілий ввід — пропускаю.")
+    cleanup(None)
+    return ""
+
+# ---------------- бездротове налагодження БЕЗ кабелю (Android 11+, mDNS + adb pair) ----------------
+#
+# Кабель потрібен лише для старої схеми 'adb tcpip 5555'. Якщо на телефоні увімкнено
+# Параметри -> Для розробників -> Бездротове налагодження, телефон сам анонсує себе
+# в LAN через mDNS (_adb-tls-connect для підключення, _adb-tls-pairing для парування),
+# і програма підключається БЕЗ кабелю: знаходить IP:порт сама, просить тільки код з екрану.
+
+MDNS_ADDR = "224.0.0.251"
+MDNS_PORT = 5353
+ADB_PAIR_SVC = "_adb-tls-pairing._tcp.local"
+ADB_CONN_SVC = "_adb-tls-connect._tcp.local"
+
+
+def _mdns_encode_name(name):
+    out = b""
+    for part in name.split("."):
+        b = part.encode("utf-8")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _mdns_decode_name(pkt, off):
+    """Декодувати DNS-ім'я з підтримкою compression-пойнтерів. Повертає (ім'я, наступний offset)."""
+    labels = []
+    consumed = None
+    jumps = 0
+    while True:
+        if off >= len(pkt):
+            return "", (consumed if consumed is not None else off)
+        ln = pkt[off]
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(pkt):
+                return "", (consumed if consumed is not None else off)
+            if consumed is None:
+                consumed = off + 2
+            off = ((ln & 0x3F) << 8) | pkt[off + 1]
+            jumps += 1
+            if jumps > 16:
+                return "", consumed
+            continue
+        if ln == 0:
+            off += 1
+            if consumed is None:
+                consumed = off
+            break
+        off += 1
+        if off + ln > len(pkt):
+            return "", (consumed if consumed is not None else off)
+        labels.append(pkt[off:off + ln])
+        off += ln
+    try:
+        name = b".".join(labels).decode("utf-8", "replace")
+    except Exception:
+        name = ""
+    return name, consumed
+
+
+def _mdns_build_query(services):
+    import struct
+    hdr = struct.pack(">HHHHHH", 0, 0, len(services), 0, 0, 0)
+    body = b""
+    for s in services:
+        body += _mdns_encode_name(s) + struct.pack(">HH", 12, 1)  # PTR, IN
+    return hdr + body
+
+
+def _mdns_parse_packet(pkt):
+    """Розібрати mDNS-пакет, повернути список (owner_name, rtype, rdata)."""
+    import struct
+    if len(pkt) < 12:
+        return []
+    try:
+        _id, _fl, qd, an, ns, ar = struct.unpack(">HHHHHH", pkt[:12])
+    except Exception:
+        return []
+    off = 12
+    try:
+        for _ in range(qd):
+            _, off = _mdns_decode_name(pkt, off)
+            off += 4
+        recs = []
+        for _ in range(an + ns + ar):
+            if off + 10 > len(pkt):
+                break
+            name, off = _mdns_decode_name(pkt, off)
+            rtype, _rc, _ttl, rdlen = struct.unpack(">HHIH", pkt[off:off + 10])
+            off += 10
+            rdata = pkt[off:off + rdlen]
+            off += rdlen
+            recs.append((name, rtype, rdata))
+        return recs
+    except Exception:
+        return []
+
+
+def mdns_discover_adb(timeout=2.5):
+    """Знайти телефони з Бездротовим налагодженням через mDNS (без кабелю, без скану портів).
+
+    Повертає список dict: {kind: 'pair'|'connect', instance, host, port, ips, txt}.
+    """
+    import struct
+    query = _mdns_build_query([ADB_PAIR_SVC, ADB_CONN_SVC])
+    inst = {}      # (kind, instance) -> dict
+    host_ips = {}  # lower(host) -> [ip]
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    except Exception as e:
+        log(f"mDNS: нема UDP-сокета: {e}")
+        return []
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", MDNS_PORT))
+        except OSError:
+            log("mDNS: порт 5353 зайнято іншою програмою — авто-пошук по Wi-Fi неможливий, запропоную ручне введення.")
+            return []
+        try:
+            mreq = socket.inet_aton(MDNS_ADDR) + socket.inet_aton("0.0.0.0")
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError as e:
+            log(f"mDNS: не вдалося підписатись на multicast: {e}")
+            return []
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        except OSError:
+            pass
+        sock.settimeout(0.5)
+        deadline = time.time() + max(1.0, timeout)
+        nxt_q = 0.0
+        while time.time() < deadline:
+            now = time.time()
+            if now >= nxt_q:
+                try:
+                    sock.sendto(query, (MDNS_ADDR, MDNS_PORT))
+                except OSError:
+                    pass
+                nxt_q = now + 0.8
+            try:
+                data, _addr = sock.recvfrom(9000)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            for name, rtype, rdata in _mdns_parse_packet(data):
+                lname = name.lower()
+                kind = ""
+                if lname == ADB_PAIR_SVC:
+                    kind = "pair"
+                elif lname == ADB_CONN_SVC:
+                    kind = "connect"
+                if rtype == 12 and kind:  # PTR: власник=сервіс, rdata=інстанс
+                    ins, _ = _mdns_decode_name(rdata, 0)
+                    if ins:
+                        key = (kind, ins)
+                        inst.setdefault(key, {"kind": kind, "instance": ins, "host": "",
+                                              "port": 0, "ips": [], "txt": []})
+                elif rtype == 33:  # SRV: власник=інстанс, всередині порт і хост
+                    if len(rdata) >= 6:
+                        port = struct.unpack(">H", rdata[4:6])[0]
+                        host, _ = _mdns_decode_name(rdata, 6)
+                        for key in list(inst.keys()):
+                            if key[1].lower() == lname:
+                                inst[key]["port"] = port
+                                inst[key]["host"] = host.rstrip(".")
+                elif rtype == 1:  # A: власник=хост
+                    if len(rdata) == 4:
+                        ip = ".".join(str(b) for b in rdata)
+                        host_ips.setdefault(lname, [])
+                        if ip not in host_ips[lname]:
+                            host_ips[lname].append(ip)
+                elif rtype == 16:  # TXT: власник=інстанс
+                    strs = []
+                    i = 0
+                    while i < len(rdata):
+                        ln = rdata[i]
+                        i += 1
+                        strs.append(rdata[i:i + ln].decode("utf-8", "replace"))
+                        i += ln
+                    for key in list(inst.keys()):
+                        if key[1].lower() == lname and strs:
+                            inst[key]["txt"] = strs
+        out = []
+        for _key, d in inst.items():
+            d["ips"] = list(host_ips.get(d["host"].lower(), []))
+            if d["port"] and d["ips"]:
+                out.append(d)
+        # Спочатку connect (до них можна одразу), потім pair (потрібен код)
+        out.sort(key=lambda d: (0 if d["kind"] == "connect" else 1, d["ips"][0]))
+        return out
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def adb_pair_verify(ip, pair_port, code, timeout=30):
+    """adb pair <ip>:<pair_port> з кодом з екрану телефону. True якщо 'Successfully paired'."""
+    serial = f"{ip}:{pair_port}"
+    log(f"adb pair {serial} (код з екрану телефону)...")
+    try:
+        r = subprocess.run(["adb", "pair", serial], input=(code.strip() + "\n"),
+                           capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.strip().splitlines():
+            if line.strip():
+                log(f"   | {line.strip()}")
+        if "Successfully paired" in out:
+            log("Парування вдалося.")
+            return True
+    except FileNotFoundError:
+        log("adb не знайдено.")
+        return False
+    except subprocess.TimeoutExpired:
+        log("adb pair завис (таймаут).")
+        return False
+    log("Парування НЕ вдалося. Код одноразовий — відкрийте екран парування заново і спробуйте ще.")
+    return False
+
+
+def get_device_display_name(serial):
+    """Прочитати 'Виробник Модель (Android X)' з уже підключеного пристрою."""
+    man = _adb_shell_on(serial, ["shell", "getprop", "ro.product.manufacturer"])
+    mod = _adb_shell_on(serial, ["shell", "getprop", "ro.product.model"])
+    andr = _adb_shell_on(serial, ["shell", "getprop", "ro.build.version.release"])
+    name = f"{man} {mod}".strip() or "невідома модель"
+    if andr:
+        name += f" (Android {andr})"
+    return name
+
+
+def _prompt(text):
+    try:
+        return input(text).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def _stdin_interactive():
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def interactive_pick_wireless(conns, pairs, pair_code=None, pick=None):
+    """Меню Wi-Fi пристроїв без кабелю. Повертає (action, dev).
+
+    action: 'connect' (adb connect), 'pair' (adb pair по коду), 'manual' (ручне введення), '' (пропуск).
+    """
+    items = [("connect", d) for d in conns] + [("pair", d) for d in pairs]
+    if not items:
+        return "", None
+    log("")
+    log("Знайдено по Wi-Fi БЕЗ кабелю:")
+    for i, (act, d) in enumerate(items, 1):
+        host = (d["host"] or d["instance"]).replace(".local", "")
+        if act == "connect":
+            log(f"  {i}. [підключити] {host} — {d['ips'][0]}:{d['port']}")
+        else:
+            log(f"  {i}. [спарувати] {host} — {d['ips'][0]}:{d['port']} (потрібен 6-значний код з екрану)")
+    log(f"  {len(items) + 1}. Ввести IP/порти/код вручну")
+    log("  0. Пропустити")
+    log("")
+
+    def match(p):
+        p = str(p).strip()
+        if p.isdigit():
+            idx = int(p)
+            if 1 <= idx <= len(items):
+                return items[idx - 1]
+            return None
+        for act, d in items:
+            if d["ips"] and (d["ips"][0] == p or p in d["instance"] or p in (d["host"] or "")):
+                return (act, d)
+        return None
+
+    if pick:
+        m = match(pick)
+        if m:
+            log(f"Автовибір (--pick {pick}).")
+            return m
+        log(f"--pick={pick} ні з чим не збігся, питаю вручну...")
+    if not _stdin_interactive():
+        if len(items) == 1 and items[0][0] == "connect":
+            log(f"Неінтерактивний режим — підключаюсь до {items[0][1]['ips'][0]}:{items[0][1]['port']}.")
+            return items[0]
+        if pair_code:
+            for act, d in items:
+                if act == "pair":
+                    log("Неінтерактивний режим — паруюсь по --pair-code.")
+                    return (act, d)
+        log("Неінтерактивний режим — вибрати не можу, пропускаю.")
+        return "", None
+    ans = _prompt(f"Введіть номер (1-{len(items) + 1}), IP, або 0/Enter щоб пропустити: ")
+    if not ans or ans == "0":
+        return "", None
+    if ans == str(len(items) + 1):
+        return "manual", None
+    m = match(ans)
+    if m:
+        return m
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ans):
+        return "manual_ip", {"ips": [ans]}
+    log("Незрозумілий ввід — пропускаю.")
+    return "", None
+
+
+def _wireless_do_pair(ip, pair_port, pair_code):
+    """Запитати код (або взяти --pair-code) і виконати adb pair. Повертає True/False."""
+    code = (pair_code or "").strip()
+    if not code:
+        if not _stdin_interactive():
+            log("Неінтерактивний режим і коду парування нема (--pair-code) — пропускаю.")
+            return False
+        log("На телефоні відкрийте 'Pair device with pairing code' — там 6-значний код.")
+        code = _prompt("Введіть код з екрану телефону: ")
+    if not code:
+        return False
+    return adb_pair_verify(ip, pair_port, code)
+
+
+def _wireless_manual(pair_code):
+    """Ручне введення IP/портів/коду з екрану телефону. Повертає (ip, port, ok)."""
+    log("")
+    log("Ручне введення (з екрану: Параметри → Для розробників → Бездротове налагодження):")
+    ip = _prompt("IP телефону (напр. 192.168.1.50, Enter щоб пропустити): ")
+    if not ip:
+        return "", 0, False
+    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        log("Схоже не на IP — пропускаю.")
+        return "", 0, False
+    pair_port = _prompt("Порт парування ('Pair device with pairing code', Enter якщо телефон вже спаровано): ")
+    if pair_port:
+        if not pair_port.isdigit():
+            log("Порт має бути числом — пропускаю.")
+            return "", 0, False
+        if not _wireless_do_pair(ip, int(pair_port), pair_code):
+            return "", 0, False
+    cport = _prompt("Порт підключення ('IP address & Port', напр. 37123): ")
+    if not cport or not cport.isdigit():
+        log("Без порту підключення ніяк — пропускаю.")
+        return "", 0, False
+    if adb_connect_verify(ip, int(cport)):
+        name = get_device_display_name(f"{ip}:{cport}")
+        log(f"Підключено по Wi-Fi БЕЗ кабелю: {ip}:{cport} — {name}.")
+        save_last_phone(f"{ip}:{cport}")
+        return ip, int(cport), True
+    diagnose_connect_fail(ip, int(cport))
+    return "", 0, False
+
+
+def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
+    """Підключення БЕЗ кабелю через Бездротове налагодження. Повертає (ip, port, ok)."""
+    log("")
+    log("Шукаю телефон по Wi-Fi БЕЗ кабелю (mDNS, Бездротове налагодження)...")
+    log("На телефоні має бути увімкнено: Параметри → Для розробників → Бездротове налагодження.")
+    try:
+        devs = mdns_discover_adb(timeout=mdns_timeout)
+    except Exception as e:
+        log(f"mDNS-пошук не вдався: {e}")
+        devs = []
+    conns = [d for d in devs if d["kind"] == "connect"]
+    pairs = [d for d in devs if d["kind"] == "pair"]
+    for d in conns + pairs:
+        host = (d["host"] or d["instance"]).replace(".local", "")
+        log(f"  - [{d['kind']}] {host} — {d['ips'][0]}:{d['port']}")
+    if not conns and not pairs:
+        log("По Wi-Fi (mDNS) нічого не знайдено (можливо multicast ріже роутер/брандмауер).")
+        if _stdin_interactive() and not pick:
+            ans = _prompt("Ввести IP/порти/код вручну з екрану телефону? (так/ні): ").lower()
+            if ans in ("так", "да", "y", "yes", "т", "д", ""):
+                return _wireless_manual(pair_code)
+        elif pick and re.match(r"^\d+\.\d+\.\d+\.\d+$", str(pick)):
+            log(f"--pick схоже на IP, пробую ручне підключення до {pick}...")
+            if adb_connect_verify(str(pick), 5555):
+                save_last_phone(f"{pick}:5555")
+                return str(pick), 5555, True
+        return "", 0, False
+    action, dev = interactive_pick_wireless(conns, pairs, pair_code, pick)
+    if action == "connect":
+        ip, port = dev["ips"][0], dev["port"]
+        if adb_connect_fast(ip, port, timeout=6.0):
+            name = get_device_display_name(f"{ip}:{port}")
+            log(f"Підключено по Wi-Fi БЕЗ кабелю: {ip}:{port} — {name}.")
+            save_last_phone(f"{ip}:{port}")
+            return ip, port, True
+        log("Пряме підключення не вдалося — можливо телефон ще не спаровано. Шукаю парування...")
+        same = [d for d in pairs if d["ips"] and d["ips"][0] == ip]
+        if same:
+            return _wireless_pair_then_connect(same[0], pair_code, mdns_timeout)
+        diagnose_connect_fail(ip, port)
+        return "", 0, False
+    if action == "pair":
+        return _wireless_pair_then_connect(dev, pair_code, mdns_timeout)
+    if action in ("manual", "manual_ip"):
+        if action == "manual_ip":
+            cport = _prompt(f"Порт підключення для {dev['ips'][0]} ('IP address & Port'): ")
+            if cport and cport.isdigit() and adb_connect_verify(dev["ips"][0], int(cport)):
+                save_last_phone(f"{dev['ips'][0]}:{cport}")
+                return dev["ips"][0], int(cport), True
+            return "", 0, False
+        return _wireless_manual(pair_code)
+    return "", 0, False
+
+
+def _wireless_pair_then_connect(pair_dev, pair_code, mdns_timeout=2.5):
+    """adb pair по коду, потім пошук connect-порту і adb connect. Повертає (ip, port, ok)."""
+    ip, pair_port = pair_dev["ips"][0], pair_dev["port"]
+    if not _wireless_do_pair(ip, pair_port, pair_code):
+        return "", 0, False
+    # Після парування шукаємо connect-сервіс того ж IP (порт динамічний!)
+    log("Шукаю порт підключення цього ж телефону...")
+    try:
+        devs = mdns_discover_adb(timeout=max(2.0, min(mdns_timeout, 4.0)))
+    except Exception:
+        devs = []
+    same = [d for d in devs if d["kind"] == "connect" and d["ips"] and d["ips"][0] == ip]
+    if same:
+        cport = same[0]["port"]
+    else:
+        cport_s = _prompt("Не знайшов порт автоматично. Введіть порт підключення ('IP address & Port'): ")
+        if not cport_s or not cport_s.isdigit():
+            return "", 0, False
+        cport = int(cport_s)
+    if adb_connect_fast(ip, cport, timeout=6.0):
+        name = get_device_display_name(f"{ip}:{cport}")
+        log(f"Підключено по Wi-Fi БЕЗ кабелю: {ip}:{cport} — {name}.")
+        save_last_phone(f"{ip}:{cport}")
+        return ip, cport, True
+    diagnose_connect_fail(ip, cport)
+    return "", 0, False
+
+
+# ---------------- GUI-вікно вибору пристрою (як Bluetooth-діалог) ----------------
+#
+# Замість вводу в консоль при старті (коли нема USB/відомого пристрою) вискакує
+# вікно: програма сама сканує Wi-Fi у фоні, список поповнюється наживо,
+# клік по телефону → підключення; для парування — поле коду в тому ж вікні.
+# Працює на вбудованому tkinter (нічого ставити не треба). Без дисплея —
+# автоматичний fallback у консольний режим.
+
+def _gui_usable():
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _gui_disconnect_others(devices_snapshot, keep_ip):
+    for d in devices_snapshot:
+        serials = {f"{d['ip']}:{d['port']}", (d.get("raw") or {}).get("serial", "")}
+        for serial in serials:
+            if serial and not serial.startswith(keep_ip + ":"):
+                try:
+                    subprocess.run(["adb", "disconnect", serial],
+                                   capture_output=True, timeout=10)
+                except Exception:
+                    pass
+
+
+def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+    """Спроба відкрити CyberDeck Electron UI. Повертає (ip, port, ok) або None якщо не вдалося."""
+    import json
+    import subprocess
+    import sys
+    import threading
+    import time
+    from pathlib import Path
+
+    ui_dir = ROOT / "ui"
+    if not (ui_dir / "package.json").exists():
+        return None
+
+    electron_exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    if electron_exe.exists():
+        cmd = [str(electron_exe), str(ui_dir), "--parent-python"]
+    else:
+        npm_bin = shutil.which("npm.cmd") or shutil.which("npm") or shutil.which("npx.cmd") or shutil.which("npx")
+        if not npm_bin:
+            return None
+        cmd = [npm_bin, "--prefix", str(ui_dir), "start", "--", "--parent-python"]
+
+    log("Відкриваю CyberDeck Electron UI...")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1
+        )
+    except Exception as e:
+        log(f"Не вдалося відкрити Electron UI: {e}")
+        return None
+
+    result = {"ip": "", "port": 0, "ok": False, "done": False}
+    seen_devices = {}
+    dev_lock = threading.Lock()
+
+    def send_event(event_type, data):
+        if proc.poll() is not None:
+            return
+        try:
+            line = json.dumps({"event": event_type, "data": data}, ensure_ascii=False)
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+
+    def report_device(device):
+        key = (device.get('kind', 'lan'), device.get('ip'), device.get('port'))
+        with dev_lock:
+            if key in seen_devices:
+                old = seen_devices[key]
+                if old.get('name') == "опитування..." and device.get('name') != "опитування...":
+                    seen_devices[key] = device
+                else:
+                    return
+            else:
+                if device.get('kind') == 'lan' and any(d.get('ip') == device.get('ip') and d.get('kind') == 'connect' for d in seen_devices.values()):
+                    return
+                seen_devices[key] = device
+
+        send_event('device-found', {
+            'ip': device['ip'],
+            'port': device['port'],
+            'name': device.get('name', 'Android Device'),
+            'kind': device.get('kind', 'lan'),
+            'state': device.get('state', 'device')
+        })
+
+    def run_full_scan():
+        send_event('status-update', 'Шукаю пристрої по mDNS та в мережі...')
+        # 0) Останній відомий пристрій
+        last = load_last_phone()
+        if last:
+            lip, lport = _split_serial(last, adb_port)
+            if lip and _tcp_port_open(lip, lport, 0.4):
+                name = get_device_display_name(f"{lip}:{lport}")
+                report_device({
+                    'kind': 'connect',
+                    'ip': lip,
+                    'port': lport,
+                    'name': name if name and 'невідома' not in name else f"Останній ({lip})",
+                    'state': 'device'
+                })
+
+        # 1) mDNS (Бездротове налагодження)
+        try:
+            mdevs = mdns_discover_adb(timeout=mdns_timeout)
+            for d in mdevs:
+                host = (d.get("host") or d.get("instance") or "").replace(".local", "")
+                ip = d["ips"][0] if d.get("ips") else ""
+                if not ip:
+                    continue
+                item = {
+                    "kind": d["kind"],
+                    "ip": ip,
+                    "port": d["port"],
+                    "name": host or "Android Device",
+                    "state": "device"
+                }
+                if d["kind"] == "connect":
+                    try:
+                        name = get_device_display_name(f"{ip}:{d['port']}")
+                        if name and "невідома" not in name:
+                            item["name"] = name
+                    except Exception:
+                        pass
+                report_device(item)
+        except Exception as e:
+            send_event('status-update', f'mDNS: {e}')
+
+        # 2) LAN-сканування
+        def lan_open(ip):
+            report_device({
+                "kind": "lan",
+                "ip": ip,
+                "port": adb_port,
+                "name": "опитування...",
+                "state": "device"
+            })
+
+        def lan_named(info):
+            report_device({
+                "kind": "lan",
+                "ip": info["ip"],
+                "port": adb_port,
+                "name": info.get("name", "Android Device"),
+                "state": info.get("state", "device")
+            })
+
+        try:
+            scan_lan_with_names(
+                adb_port=adb_port,
+                timeout=scan_timeout,
+                on_port_open=lan_open,
+                on_found=lan_named
+            )
+        except Exception as e:
+            send_event('status-update', f'LAN скан: {e}')
+
+        send_event('scan-progress', {'done': True, 'count': len(seen_devices)})
+        send_event('status-update', f'Пошук завершено. Знайдено {len(seen_devices)} пристроїв.')
+
+    threading.Thread(target=run_full_scan, daemon=True).start()
+
+    def read_electron_output():
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cmd = json.loads(line)
+                cmd_type = cmd.get('type')
+                if cmd_type == 'scan':
+                    with dev_lock:
+                        seen_devices.clear()
+                    threading.Thread(target=run_full_scan, daemon=True).start()
+                elif cmd_type == 'connect':
+                    ip = cmd['ip']
+                    port = int(cmd.get('port', adb_port))
+                    send_event('status-update', f'Підключення до {ip}:{port}...')
+                    def do_connect(tip=ip, tport=port):
+                        ok = adb_connect_fast(tip, tport)
+                        name = get_device_display_name(f"{tip}:{tport}") if ok else ""
+                        if ok:
+                            save_last_phone(f"{tip}:{tport}")
+                            send_event('connect-result', {'success': True, 'ip': tip, 'port': tport, 'name': name})
+                            send_event('status-update', f'Підключено до {tip}:{tport}')
+                            time.sleep(0.6)
+                            send_event('close-window', {})
+                            result.update(ip=tip, port=tport, ok=True, done=True)
+                        else:
+                            send_event('connect-result', {'success': False, 'ip': tip, 'port': tport, 'error': 'Не вдалося підключитися'})
+                            send_event('status-update', f'Помилка підключення до {tip}:{tport}')
+                    threading.Thread(target=do_connect, daemon=True).start()
+                elif cmd_type == 'pair':
+                    ip = cmd['ip']
+                    port = int(cmd['port'])
+                    code = str(cmd['code']).strip()
+                    send_event('status-update', f'Парування з {ip}:{port}...')
+                    def do_pair(tip=ip, tport=port, tcode=code):
+                        ok = adb_pair_verify(tip, tport, tcode)
+                        if ok:
+                            send_event('pair-result', {'success': True, 'ip': tip, 'port': tport})
+                            send_event('status-update', 'Успішно спаровано! Шукаю порт підключення...')
+                            try:
+                                devs = mdns_discover_adb(timeout=2.0)
+                                same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == tip]
+                                if same:
+                                    cp = same[0]["port"]
+                                    conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
+                                    name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
+                                    if conn_ok:
+                                        save_last_phone(f"{tip}:{cp}")
+                                        send_event('connect-result', {'success': True, 'ip': tip, 'port': cp, 'name': name})
+                                        send_event('status-update', f'Підключено: {tip}:{cp} — {name}')
+                                        time.sleep(0.6)
+                                        send_event('close-window', {})
+                                        result.update(ip=tip, port=cp, ok=True, done=True)
+                                        return
+                            except Exception:
+                                pass
+                        else:
+                            send_event('pair-result', {'success': False, 'ip': tip, 'port': tport, 'error': 'Парування не вдалося'})
+                            send_event('status-update', 'Парування не вдалося. Перевірте код.')
+                    threading.Thread(target=do_pair, daemon=True).start()
+                elif cmd_type == 'close':
+                    result['done'] = True
+            except Exception:
+                pass
+
+    t_read = threading.Thread(target=read_electron_output, daemon=True)
+    t_read.start()
+
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        log("Electron не зміг стартувати — переходжу на стандартне вікно...")
+        return None
+
+    log("CyberDeck Electron UI відкрито.")
+    while proc.poll() is None and not result['done']:
+        time.sleep(0.1)
+
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    if result['ok']:
+        return result['ip'], result['port'], True
+
+    return "", 0, False
+
+
+def gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+    """Вікно зі списком телефонів (mDNS + LAN), парування і підключення."""
+    res = electron_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+    if res is not None:
+        return res
+    return _tkinter_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+
+
+def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+    """Вікно зі списком телефонів (mDNS + LAN), парування і підключення.
+
+    Повертає (ip, port, ok) або None якщо вікно відкрити неможливо (нема дисплея).
+    Викликати з головного потоку. Сканування і adb-операції — у фонових потоках.
+    """
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import ttk
+
+    result = {"ip": "", "port": 0, "ok": False}
+    state = {"closed": False, "cancelled": False}
+    devices = []
+    dev_lock = threading.Lock()
+    q = queue.Queue()
+
+    root = tk.Tk()
+    root.title("Virtual USB Cable — підключення телефону")
+    root.geometry("600x560")
+    root.minsize(520, 480)
+    try:
+        root.eval("tk::PlaceWindow . center")
+    except Exception:
+        pass
+    try:
+        root.attributes("-topmost", True)  # як Bluetooth-діалог — поверх усіх
+    except Exception:
+        pass
+
+    status_var = tk.StringVar(value="Шукаю телефон по Wi-Fi...")
+
+    list_frame = ttk.Frame(root)
+    list_frame.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+    lb = tk.Listbox(list_frame, height=11)
+    sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    lb.pack(side="left", fill="both", expand=True)
+    sb.pack(side="right", fill="y")
+
+    prog = ttk.Progressbar(root, mode="indeterminate")
+    prog.pack(fill="x", padx=10, pady=(0, 4))
+    prog.start(15)
+
+    status = ttk.Label(root, textvariable=status_var, wraplength=570)
+    status.pack(fill="x", padx=10, pady=2)
+
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(fill="x", padx=10, pady=5)
+    btn_connect = ttk.Button(btn_frame, text="Підключити")
+    btn_rescan = ttk.Button(btn_frame, text="Оновити")
+    btn_manual_toggle = ttk.Button(btn_frame, text="Вручну...")
+    btn_cancel = ttk.Button(btn_frame, text="Пропустити (демо)")
+    for b in (btn_connect, btn_rescan, btn_manual_toggle, btn_cancel):
+        b.pack(side="left", padx=(0, 6))
+
+    pair_frame = ttk.LabelFrame(root, text="Парування (код з екрану телефону)")
+    code_var = tk.StringVar(value=pair_code or "")
+    ttk.Label(pair_frame, text="Код:").pack(side="left", padx=(6, 2))
+    code_entry = ttk.Entry(pair_frame, textvariable=code_var, width=12)
+    code_entry.pack(side="left")
+    btn_pair = ttk.Button(pair_frame, text="Спарувати і підключити")
+    btn_pair.pack(side="left", padx=6)
+
+    manual_frame = ttk.LabelFrame(root, text="Вручну (з екрану: Бездротове налагодження)")
+    man_vars = {}
+    for key, label, width in (("ip", "IP:", 16), ("pair", "Порт парування:", 8),
+                              ("code", "Код:", 8), ("conn", "Порт підключ.:", 8)):
+        row = ttk.Frame(manual_frame)
+        row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row, text=label, width=16).pack(side="left")
+        var = tk.StringVar()
+        ttk.Entry(row, textvariable=var, width=width).pack(side="left")
+        man_vars[key] = var
+    btn_manual_go = ttk.Button(manual_frame, text="Спарувати і підключити")
+    btn_manual_go.pack(padx=6, pady=4)
+
+    def set_status(text):
+        log(text)
+        q.put(("status", text))
+
+    def set_busy(busy):
+        q.put(("busy", busy))
+
+    def refresh_list(items):
+        # Зберігаємо вибір користувача при живому оновленні списку
+        sel = lb.curselection()
+        sel_key = None
+        if sel:
+            try:
+                cur = lb.get(sel[0])
+                sel_key = cur
+            except Exception:
+                pass
+        lb.delete(0, "end")
+        restore = None
+        for i, d in enumerate(items):
+            if d["kind"] == "pair":
+                text = f"[спарувати] {d['name']} — {d['ip']}:{d['port']}"
+            elif d["kind"] == "connect":
+                text = f"[Wi-Fi] {d['name']} — {d['ip']}:{d['port']}"
+            else:
+                text = f"[5555] {d['name']} — {d['ip']}:{d['port']}"
+            lb.insert("end", text)
+            if sel_key is not None and text == sel_key:
+                restore = i
+        if restore is not None:
+            lb.selection_set(restore)
+            lb.see(restore)
+        elif items and not sel:
+            lb.selection_set(0)
+
+    def current():
+        sel = lb.curselection()
+        if not sel:
+            return None
+        with dev_lock:
+            return devices[sel[0]] if sel[0] < len(devices) else None
+
+    def snapshot():
+        with dev_lock:
+            return list(devices)
+
+    def add_device(item):
+        with dev_lock:
+            for i, x in enumerate(devices):
+                if (x["kind"], x["ip"], x["port"]) == (item["kind"], item["ip"], item["port"]):
+                    devices[i] = item
+                    break
+            else:
+                # Той самий IP з mDNS вже є — LAN-дублікат не додаємо
+                if item["kind"] == "lan" and any(x["ip"] == item["ip"] for x in devices):
+                    return
+                devices.append(item)
+            snapshot = list(devices)
+        q.put(("devices", snapshot))
+
+    def do_scan():
+        # 0) Швидкий шлях: останній відомий пристрій (як BT-перепідключення, ~1-2с)
+        last = load_last_phone()
+        if last and not state["closed"]:
+            lip, lport = _split_serial(last, adb_port)
+            set_status(f"Перепідключаюсь до відомого: {last}...")
+            try:
+                if _tcp_port_open(lip, lport, 0.5) and adb_connect_fast(lip, lport, timeout=4.0):
+                    name = get_device_display_name(f"{lip}:{lport}")
+                    save_last_phone(f"{lip}:{lport}")
+                    result.update(ip=lip, port=lport, ok=True)
+                    q.put(("connect_result", True, f"Підключено: {lip}:{lport} — {name}"))
+                    q.put(("scan_done",))
+                    return
+            except Exception:
+                pass
+        if state["closed"]:
+            return
+        # 1) mDNS (Бездротове налагодження) — зазвичай відповідає за <1с
+        set_status("Шукаю по mDNS (Бездротове налагодження)...")
+        try:
+            mdevs = mdns_discover_adb(timeout=mdns_timeout)
+        except Exception as e:
+            mdevs = []
+            set_status(f"mDNS не вдався: {e}")
+        for d in mdevs:
+            if state["closed"]:
+                return
+            host = (d["host"] or d["instance"]).replace(".local", "")
+            item = {"kind": d["kind"], "ip": d["ips"][0], "port": d["port"],
+                    "name": host, "raw": d}
+            if d["kind"] == "connect":
+                # Реальну модель підтягуємо одразу (швидкий connect + getprop)
+                try:
+                    subprocess.run(["adb", "connect", f"{item['ip']}:{item['port']}"],
+                                   capture_output=True, timeout=20)
+                    name = get_device_display_name(f"{item['ip']}:{item['port']}")
+                    if name and "невідома" not in name:
+                        item["name"] = name
+                except Exception:
+                    pass
+            add_device(item)
+        if state["closed"]:
+            return
+        # 2) LAN-скан: пріоритет — підмережа останнього IP; рядки з'являються наживо
+        set_status("Сканую LAN (порт 5555)...")
+        last_ip = _split_serial(load_last_phone(), adb_port)[0] or None
+
+        def lan_open(ip):
+            if state["closed"]:
+                return
+            add_device({"kind": "lan", "ip": ip, "port": adb_port,
+                        "name": "опитування...", "raw": {"serial": f"{ip}:{adb_port}"}})
+
+        def lan_named(info):
+            if state["closed"]:
+                return
+            add_device({"kind": "lan", "ip": info["ip"], "port": adb_port,
+                        "name": info["name"], "raw": info})
+
+        try:
+            # Імена/рядки приходять через колбеки наживо; повернений список тут не потрібен
+            scan_lan_with_names(adb_port=adb_port, timeout=scan_timeout,
+                                first_ip=last_ip, on_port_open=lan_open,
+                                on_found=lan_named)
+        except Exception:
+            pass
+        q.put(("scan_done",))
+
+    def worker_connect(d):
+        set_status(f"Підключаюсь до {d['ip']}:{d['port']}...")
+        ok = adb_connect_fast(d["ip"], d["port"], timeout=6.0)
+        if ok:
+            name = d["name"]
+            if d["kind"] == "connect" or name == "опитування...":
+                name = get_device_display_name(f"{d['ip']}:{d['port']}")
+            save_last_phone(f"{d['ip']}:{d['port']}")
+            _gui_disconnect_others(snapshot(), d["ip"])
+            result.update(ip=d["ip"], port=d["port"], ok=True)
+            q.put(("connect_result", True, f"Підключено: {d['ip']}:{d['port']} — {name}"))
+        else:
+            q.put(("connect_result", False, f"Не вдалося підключитись до {d['ip']}:{d['port']}."))
+        set_busy(False)
+
+    def worker_pair(d, code):
+        ip, pp = d["ip"], d["port"]
+        set_status(f"Парування з {ip}:{pp}...")
+        if not adb_pair_verify(ip, pp, code):
+            q.put(("connect_result", False, "Парування не вдалося. Код одноразовий — оновіть екран."))
+            set_busy(False)
+            return
+        set_status("Шукаю порт підключення цього телефону...")
+        try:
+            devs = mdns_discover_adb(timeout=2.0)
+        except Exception:
+            devs = []
+        same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == ip]
+        if not same:
+            q.put(("status", "Порт не знайшовся — введіть його вручну (IP address & Port)."))
+            man_vars["ip"].set(ip)
+            q.put(("show_manual",))
+            set_busy(False)
+            return
+        cp = same[0]["port"]
+        if adb_connect_fast(ip, cp, timeout=6.0):
+            name = get_device_display_name(f"{ip}:{cp}")
+            save_last_phone(f"{ip}:{cp}")
+            _gui_disconnect_others(snapshot(), ip)
+            result.update(ip=ip, port=cp, ok=True)
+            q.put(("connect_result", True, f"Підключено БЕЗ кабелю: {ip}:{cp} — {name}"))
+        else:
+            q.put(("connect_result", False, "Підключення не вдалося."))
+        set_busy(False)
+
+    def worker_manual(ip, pair_s, code, conn_s):
+        if pair_s:
+            set_status(f"Парування з {ip}:{pair_s}...")
+            if not adb_pair_verify(ip, int(pair_s), code):
+                q.put(("connect_result", False, "Парування не вдалося. Код одноразовий — оновіть екран."))
+                set_busy(False)
+                return
+        set_status(f"Підключаюсь до {ip}:{conn_s}...")
+        if adb_connect_fast(ip, int(conn_s), timeout=6.0):
+            name = get_device_display_name(f"{ip}:{conn_s}")
+            save_last_phone(f"{ip}:{conn_s}")
+            _gui_disconnect_others(snapshot(), ip)
+            result.update(ip=ip, port=int(conn_s), ok=True)
+            q.put(("connect_result", True, f"Підключено БЕЗ кабелю: {ip}:{conn_s} — {name}"))
+        else:
+            q.put(("connect_result", False, "Підключення не вдалося."))
+        set_busy(False)
+
+    def on_connect():
+        d = current()
+        if not d:
+            status_var.set("Виберіть пристрій зі списку.")
+            return
+        if d["kind"] == "pair":
+            if not pair_frame.winfo_ismapped():
+                pair_frame.pack(fill="x", padx=10, pady=5)
+            code_entry.focus_set()
+            status_var.set(f"Для {d['ip']}:{d['port']} введіть код з екрану і натисніть «Спарувати і підключити».")
+            return
+        set_busy(True)
+        threading.Thread(target=worker_connect, args=(d,), daemon=True).start()
+
+    def on_pair_go():
+        d = current()
+        if not d or d["kind"] != "pair":
+            with dev_lock:
+                pairs = [x for x in devices if x["kind"] == "pair"]
+            d = pairs[0] if pairs else None
+        code = code_var.get().strip()
+        if not d:
+            status_var.set("Виберіть пристрій [спарувати] зі списку.")
+            return
+        if not code:
+            status_var.set("Введіть код з екрану телефону.")
+            code_entry.focus_set()
+            return
+        set_busy(True)
+        threading.Thread(target=worker_pair, args=(d, code), daemon=True).start()
+
+    def on_manual_go():
+        ip = man_vars["ip"].get().strip()
+        pair_s = man_vars["pair"].get().strip()
+        code = man_vars["code"].get().strip() or (pair_code or "")
+        conn_s = man_vars["conn"].get().strip()
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            status_var.set("Введіть коректний IP телефону.")
+            return
+        if pair_s and (not pair_s.isdigit() or not code):
+            status_var.set("Для парування потрібні порт і код з екрану.")
+            return
+        if not conn_s.isdigit():
+            status_var.set("Введіть порт підключення (IP address & Port).")
+            return
+        set_busy(True)
+        threading.Thread(target=worker_manual, args=(ip, pair_s, code, conn_s), daemon=True).start()
+
+    def on_rescan():
+        lb.delete(0, "end")
+        with dev_lock:
+            devices.clear()
+        if not prog.winfo_ismapped():
+            prog.pack(fill="x", padx=10, pady=(0, 4))
+        prog.start(15)
+        status_var.set("Шукаю телефон по Wi-Fi...")
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def on_toggle_manual():
+        if manual_frame.winfo_ismapped():
+            manual_frame.pack_forget()
+        else:
+            manual_frame.pack(fill="x", padx=10, pady=5)
+
+    def close_ok():
+        state["closed"] = True
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    def on_cancel():
+        state["cancelled"] = True
+        close_ok()
+
+    def on_queue():
+        try:
+            while True:
+                msg = q.get_nowait()
+                tag = msg[0]
+                if tag == "status":
+                    status_var.set(msg[1])
+                elif tag == "devices":
+                    refresh_list(msg[1])
+                elif tag == "scan_done":
+                    prog.stop()
+                    prog.pack_forget()
+                    with dev_lock:
+                        n = len(devices)
+                    if n:
+                        status_var.set(f"Знайдено: {n}. Виберіть пристрій і натисніть «Підключити».")
+                        try:
+                            root.bell()
+                        except Exception:
+                            pass
+                    else:
+                        status_var.set("Нічого не знайдено. Увімкніть Бездротове налагодження, «Оновити» або «Вручну».")
+                elif tag == "busy":
+                    busy = msg[1]
+                    widgets = (btn_connect, btn_rescan, btn_manual_toggle,
+                               btn_cancel, btn_pair, btn_manual_go)
+                    for w in widgets:
+                        try:
+                            w.configure(state="disabled" if busy else "normal")
+                        except Exception:
+                            pass
+                elif tag == "show_manual":
+                    if not manual_frame.winfo_ismapped():
+                        manual_frame.pack(fill="x", padx=10, pady=5)
+                elif tag == "connect_result":
+                    _, ok, text = msg
+                    status_var.set(text)
+                    if ok:
+                        root.after(900, close_ok)
+        except queue.Empty:
+            pass
+        if not state["closed"]:
+            root.after(120, on_queue)
+
+    btn_connect.configure(command=on_connect)
+    btn_rescan.configure(command=on_rescan)
+    btn_manual_toggle.configure(command=on_toggle_manual)
+    btn_cancel.configure(command=on_cancel)
+    btn_pair.configure(command=on_pair_go)
+    btn_manual_go.configure(command=on_manual_go)
+    lb.bind("<Double-Button-1>", lambda _e: on_connect())
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    threading.Thread(target=do_scan, daemon=True).start()
+    root.after(120, on_queue)
+    try:
+        root.focus_force()
+    except Exception:
+        pass
+    root.mainloop()
+    if state["cancelled"] or not result["ok"]:
+        if not result["ok"]:
+            return "", 0, False
+    return result["ip"], result["port"], result["ok"]
+
+
+def _last_known_ip(default_port):
+    """Останній відомий IP телефону (для пріоритету скану). Повертає (ip, port) або ('', port)."""
+    last = load_last_phone()
+    if last:
+        return _split_serial(last, default_port)
+    return "", default_port
+
+
+def _try_lan_scan_pick(adb_port, scan_timeout, pick):
+    """Допоміжне: просканувати LAN, показати назви, дати вибрати, підключитись. Повертає (ip, ok)."""
+    try:
+        first_ip = _last_known_ip(adb_port)[0] or None
+        infos = scan_lan_with_names(adb_port=adb_port, timeout=scan_timeout, first_ip=first_ip)
+    except Exception as e:
+        log(f"LAN-сканування не вдалося: {e}")
+        return "", False
+    if not infos:
+        return "", False
+    chosen_ip = interactive_pick_device(infos, adb_port, pick=pick)
+    if not chosen_ip:
+        return "", False
+    # Порт уже відкритий і назву прочитано — вистачить швидкого конекту
+    ok = adb_connect_fast(chosen_ip, adb_port, timeout=5.0)
+    if ok:
+        save_last_phone(f"{chosen_ip}:{adb_port}")
+        return chosen_ip, True
+    diagnose_connect_fail(chosen_ip, adb_port)
+    return "", False
+
+
+def _split_serial(serial, default_port):
+    """'192.168.1.50:37123' -> ('192.168.1.50', 37123)."""
+    try:
+        host, _, port = serial.partition(":")
+        return host, int(port) if port.isdigit() else default_port
+    except Exception:
+        return serial, default_port
+
+
+def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
+                     allow_scan=True, force_scan=False, scan_timeout=0.45, pick=None,
+                     allow_wireless=True, mdns_timeout=2.5, pair_code=None,
+                     use_gui=True):
+    """Повний ланцюжок: USB->tcpip->connect, БЕЗ кабелю (Бездротове налагодження), скан LAN.
+
+    Повертає (adb_host, adb_port_eff, demo_needed). Порт окремо бо в Бездротового
+    налагодження він динамічний (не 5555).
+    """
     if dry_run:
-        log("(dry-run) пропустив би tcpip/connect")
-        return "127.0.0.1", True
+        log("(dry-run) пропустив би tcpip/pair/connect/сканування LAN")
+        return "127.0.0.1", adb_port, True
     # adb server вже запущено викликачем (main); список або передано, або читаємо свіжий
     if devs is None:
         devs = print_adb_devices()
     # вже є TCP device?
+    already_tcp = ""
     for s, st, t in devs:
         if ":" in s and st == "device":
-            log(f"Вже є Wi-Fi пристрій {s} — tcpip пропускаю.")
-            save_last_phone(s)
-            return s.split(":")[0], False
+            already_tcp = s
+            break
+    if already_tcp and not force_scan:
+        log(f"Вже є Wi-Fi пристрій {already_tcp} — tcpip пропускаю.")
+        save_last_phone(already_tcp)
+        host, port = _split_serial(already_tcp, adb_port)
+        return host, port, False
+    if already_tcp and force_scan and (allow_scan or allow_wireless):
+        # --scan: навіть якщо щось вже підключено, показуємо ВСІ доступні IP і даємо вибрати
+        log(f"Примусове сканування (--scan): вже підключено {already_tcp}, але дивлюсь всі IP в мережі...")
+        if allow_wireless:
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            if ok:
+                return ip, port, False
+        if allow_scan:
+            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            if ok:
+                return ip, adb_port, False
+        log(f"Залишаю вже підключений {already_tcp}.")
+        host, port = _split_serial(already_tcp, adb_port)
+        return host, port, False
     if phone_ip_override:
         log(f"Задано --phone-ip={phone_ip_override}, роблю adb connect САМ...")
         ok = adb_connect_verify(phone_ip_override, adb_port)
         if ok:
             save_last_phone(f"{phone_ip_override}:{adb_port}")
-        return phone_ip_override, not ok
+        return phone_ip_override, adb_port, not ok
     has_usb = any(":" not in s and st == "device" for s, st, t in devs)
     if not has_usb:
         # Телефон міг залишитись в tcpip-режимі з минулого запуску (USB тоді мертвий).
         # Пробуємо реанімацію: reconnect + останній відомий IP — все САМ.
         log("USB-пристроїв нема. Пробую реанімацію (телефон міг залишитись в tcpip-режимі)...")
         run(["adb", "reconnect"], timeout=30)
-        time.sleep(2)
+        time.sleep(1.5)
         devs = print_adb_devices()
         for s, st, t in devs:
             if ":" in s and st == "device":
                 log(f"Реанімація вдалася: {s}.")
                 save_last_phone(s)
-                return s.split(":")[0], False
+                host, port = _split_serial(s, adb_port)
+                return host, port, False
         last = load_last_phone()
         if last:
             log(f"Пробую останній відомий пристрій САМ: {last} ...")
-            lip = last.split(":")[0]
-            lport = int(last.split(":")[1]) if ":" in last and last.split(":")[1].isdigit() else adb_port
-            if adb_connect_verify(lip, lport, attempts=2):
+            lip, lport = _split_serial(last, adb_port)
+            # Спочатку швидкий TCP-пречек (0.5с), щоб не висіти на мертвому IP,
+            # потім швидкий конект (без довгих ретраїв — пристрій же відомий).
+            fast_ok = False
+            try:
+                if _tcp_port_open(lip, lport, 0.5):
+                    fast_ok = adb_connect_fast(lip, lport, timeout=4.0)
+            except Exception:
+                fast_ok = False
+            if fast_ok:
                 save_last_phone(f"{lip}:{lport}")
-                return lip, False
+                return lip, lport, False
+        # Кабелю нема — вискакує ВІКНО зі знайденими телефонами (як Bluetooth):
+        # скан у фоні, клік → підключення, код парування — в тому ж вікні.
+        if use_gui and _gui_usable() and not pick:
+            log("Відкриваю вікно вибору пристрою...")
+            try:
+                g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+            except Exception as e:
+                log(f"Вікно не відкрилось ({e}) — продовжую в консолі.")
+                g = None
+            if g is not None:
+                ip, port, ok = g
+                if ok:
+                    return ip, port, False
+                log("Вікно закрито без вибору — демо-режим.")
+                return "127.0.0.1", adb_port, True
+        # Без вікна (нема дисплея / --no-gui / --pick): консольний флоу.
+        # СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
+        # і тільки потім класичний скан порту 5555 (для тих хто вже робив tcpip по USB).
+        if allow_wireless:
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            if ok:
+                return ip, port, False
+        if allow_scan:
+            log("")
+            log("Дивлюсь усі доступні IP-адреси в мережі (порт 5555)...")
+            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            if ok:
+                return ip, adb_port, False
+            log("У мережі нічого придатного не вибрано.")
         log("Реанімація не вдалася. Варіанти:")
+        log("  - БЕЗ КАБЕЛЮ (Android 11+): увімкніть 'Бездротове налагодження' і запустіть знову — запропоную парування по коду")
         log("  - Перевставте USB-кабель і (якщо телефон завис в tcpip) перезавантажте телефон, потім START.bat")
         log("  - Або задайте IP вручну: --phone-ip <IP з Налаштування -> Про телефон -> Статус>")
         log("  - Або демо без телефону: START.bat demo")
-        return "127.0.0.1", True
+        return "127.0.0.1", adb_port, True
     # КРОК 1: IP визначаємо ДО tcpip, поки USB живий
     log("Визначаю IP телефону ДО перезапуску adbd (поки USB живий)...")
     candidates = detect_phone_ips()
@@ -360,15 +2010,288 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None):
         log("До tcpip IP не визначився — пробую ще раз (може не вийти, USB вже мертвий)...")
         candidates = detect_phone_ips()
     if not candidates:
+        log("Не визначив IP через USB. Пробую БЕЗ кабелю, потім скан мережі...")
+        if allow_wireless:
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            if ok:
+                return ip, port, False
+        if allow_scan:
+            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            if ok:
+                return ip, adb_port, False
         log("Не визначив IP. Передайте вручну: --phone-ip <IP телефону>")
-        return "127.0.0.1", True
+        return "127.0.0.1", adb_port, True
     # КРОК 2: пробуємо КОЖНОГО кандидата з перевіркою
     for ip in candidates:
         if adb_connect_verify(ip, adb_port):
             save_last_phone(f"{ip}:{adb_port}")
-            return ip, False
+            return ip, adb_port, False
     diagnose_connect_fail(candidates[0], adb_port)
-    return "127.0.0.1", True
+    # USB-кандидати не підійшли — пробуємо без кабелю, потім інші пристрої в LAN
+    if allow_wireless:
+        log("")
+        log("USB-кандидати не підійшли. Пробую БЕЗ кабелю (Бездротове налагодження)...")
+        ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+        if ok:
+            return ip, port, False
+    if allow_scan:
+        log("")
+        log("Дивлюсь усі доступні IP-адреси в мережі...")
+        ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+        if ok:
+            return ip, adb_port, False
+    return "127.0.0.1", adb_port, True
+
+# ---------------- якість каналу: хотспот, замір RTT/втрат, авто-профіль ----------------
+#
+# Типова причина лагів: роздача інтернету з ПК (хотспот Windows) зазвичай працює на
+# перевантаженому 2.4 ГГц + NAT, з великим джиттером і втратами. Транспорт і бітрейт
+# за замовчуванням налаштовані під швидкий роутер, тому на хотспоті відео "пливе".
+# Лікується: визначенням хотспоту -> швидким заміром каналу -> зниженням бітрейту/
+# роздільності/fps у scrcpy + збільшенням jitter-буфера приймача.
+
+HOTSPOT_SUBNET = "192.168.137.0/24"  # стандартна підмережа хотспоту/ICS Windows
+
+
+def _decode_any(b):
+    """Декодувати вивід консольної утиліти (OEM-кодування непередбачуване)."""
+    if isinstance(b, str):
+        return b
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="replace")
+
+
+def get_adapter_info():
+    """Список мережевих інтерфейсів: [{adapter, desc, ip, prefix}]. Тільки ASCII-ознаки."""
+    infos = []
+    cur = {"adapter": "", "desc": "", "ip": "", "prefix": 24}
+    have_ip = False
+
+    def flush():
+        if cur["ip"] and _is_usable_lan(cur["ip"]):
+            infos.append(dict(cur))
+
+    try:
+        r = subprocess.run(["ipconfig"] if os.name == "nt" else ["ip", "-4", "addr", "show"],
+                           capture_output=True, timeout=15)
+        out = _decode_any(r.stdout or b"")
+    except Exception:
+        return infos
+    if os.name == "nt":
+        # Мовно-незалежно, тільки ASCII-ознаки:
+        # - порожній рядок = межа секцій (скидаємо ім'я адаптера, щоб не приписати чуже);
+        # - '*' в заголовку без IP = віртуальний адаптер роздачі ("Local Area Connection* 12",
+        #   зірочка є в усіх мовах); EN-заголовки містять 'adapter';
+        # - 'Description' (імена драйверів зазвичай англійські навіть на локалізованій Windows);
+        # - 'IPv4' є і в EN, і в RU/UA ("IPv4-адрес"); рядок 'Connection-specific DNS Suffix .:'
+        #   ігноруємо (нема '*'/'adapter'/'IPv4').
+        for line in out.splitlines():
+            s = line.strip()
+            if not s:
+                # Межа секцій: зберігаємо зібране, але ім'я НЕ скидаємо тут —
+                # після заголовка теж йде порожній рядок, а новий заголовок
+                # і так почне секцію заново (див. гілку нижче).
+                if have_ip:
+                    flush()
+                    cur = {"adapter": "", "desc": "", "ip": "", "prefix": 24}
+                    have_ip = False
+                continue
+            no_ip = not re.search(r"\d+\.\d+\.\d+\.\d+", s)
+            if s.endswith(":") and no_ip and ("*" in s or "adapter" in s.lower()):
+                if have_ip:
+                    flush()
+                cur = {"adapter": s[:-1].strip(), "desc": "", "ip": "", "prefix": 24}
+                have_ip = False
+                continue
+            low = s.lower()
+            if "description" in low and ":" in s:
+                cur["desc"] = s.split(":", 1)[1].strip()
+                continue
+            ips_in_line = re.findall(r"(\d+\.\d+\.\d+\.\d+)", s)
+            if not ips_in_line:
+                continue
+            masks = [ip for ip in ips_in_line if ip.startswith("255.")]
+            if masks and cur["ip"]:
+                cur["prefix"] = _prefix_from_netmask(masks[0])
+                continue
+            if re.search(r"IPv4", s, re.IGNORECASE):
+                for ip in ips_in_line:
+                    if not ip.startswith("255.") and _is_usable_lan(ip):
+                        if have_ip:
+                            flush()
+                            cur = {"adapter": cur["adapter"], "desc": cur["desc"],
+                                   "ip": "", "prefix": 24}
+                        cur["ip"] = ip
+                        have_ip = True
+                        break
+        if have_ip:
+            flush()
+    else:
+        for m in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", out):
+            if _is_usable_lan(m.group(1)):
+                infos.append({"adapter": "", "desc": "", "ip": m.group(1),
+                              "prefix": int(m.group(2))})
+    return infos
+
+
+def detect_hotspot(phone_ip):
+    """Чи підключено телефон через роздачу з ПК (хотспот)? Повертає (так/ні, причина)."""
+    reasons = []
+    try:
+        if phone_ip and ipaddress.ip_address(phone_ip.strip()) in ipaddress.ip_network(HOTSPOT_SUBNET):
+            reasons.append(f"IP телефону {phone_ip} у стандартній підмережі хотспоту Windows ({HOTSPOT_SUBNET})")
+    except Exception:
+        pass
+    try:
+        for a in get_adapter_info():
+            try:
+                same_net = (phone_ip and ipaddress.ip_address(phone_ip.strip())
+                            in ipaddress.ip_network(f"{a['ip']}/{a['prefix']}", strict=False))
+            except Exception:
+                same_net = False
+            if not same_net:
+                continue
+            name = (a["adapter"] + " " + a["desc"]).lower()
+            if "*" in a["adapter"]:
+                reasons.append(f"інтерфейс '{a['adapter']}' — віртуальний адаптер роздачі (hosted network)")
+            if "wi-fi direct" in name or "hotspot" in name or "hosted" in name:
+                reasons.append(f"інтерфейс '{a['adapter']}' ({a['desc']}) — роздача Wi-Fi з ПК")
+    except Exception:
+        pass
+    if reasons:
+        return True, "; ".join(dict.fromkeys(reasons))
+    return False, ""
+
+
+def measure_link(ip, count=3):
+    """Швидкий замір каналу до телефону: ping. Повертає dict(ok, rtt_avg, rtt_max, jitter, loss)."""
+    res = {"ok": False, "rtt_avg": None, "rtt_min": None, "rtt_max": None, "jitter": None, "loss": 100}
+    if os.name == "nt":
+        cmd = ["ping", "-n", str(count), "-w", "800", ip]
+    else:
+        cmd = ["ping", "-c", str(count), "-W", "1", ip]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=15 + count * 2)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return res
+    out = _decode_any(r.stdout or b"")
+    # Часи відповідей: 'time=5ms' / 'время=5мс' (знак може бути = або <;
+    # кирилична 'м' — окремий символ, тому клас [mм])
+    times = [int(x) for x in re.findall(r"(?:time|время)\s*[=<]\s*(\d+)\s*[mм]", out, re.IGNORECASE)]
+    # Середнє з підсумку: 'Average = 12' / 'Среднее = 12' / 'Середнє = 12'
+    m = re.search(r"(?:Average|Средн\w*|Середн\w*)\s*=\s*(\d+)", out, re.IGNORECASE)
+    # Втрати: '(25% loss)' / '(25% потерь)' / '(25% втрат)' — відсоток у дужках універсальний
+    ml = re.search(r"\((\d+)%", out)
+    if ml:
+        try:
+            res["loss"] = int(ml.group(1))
+        except Exception:
+            pass
+    if m:
+        res["rtt_avg"] = int(m.group(1))
+    if times:
+        res["rtt_min"] = min(times)
+        res["rtt_max"] = max(times)
+        if res["rtt_avg"] is None:
+            res["rtt_avg"] = sum(times) // len(times)
+        if len(times) >= 2:
+            res["jitter"] = max(abs(a - b) for a, b in zip(times, times[1:]))
+        else:
+            res["jitter"] = 0
+    res["ok"] = res["rtt_avg"] is not None
+    return res
+
+
+# Профілі: (scrcpy_аргументи, jitter_ms приймача, опис)
+QUALITY_PROFILES = {
+    "high": ([], 30, "повна якість (швидкий роутер)"),
+    "medium": (["-m", "1280", "-b", "6M", "--max-fps", "30"], 60,
+               "середня якість (повільний/нестабільний канал)"),
+    "low": (["-m", "1024", "-b", "4M", "--max-fps", "24"], 100,
+            "економна якість (дуже повільний канал, хотспот 2.4 ГГц)"),
+}
+
+
+def pick_quality_profile(rtt_avg, loss):
+    """Вибрати профіль за заміром: повертає ім'я профілю."""
+    try:
+        loss = int(loss)
+    except Exception:
+        loss = 0
+    if rtt_avg is None:
+        return "high" if loss == 0 else "medium"
+    if rtt_avg > 80 or loss >= 25:
+        return "low"
+    if rtt_avg > 30 or loss > 0:
+        return "medium"
+    return "high"
+
+
+HOTSPOT_TIPS = [
+    "Увімкніть діапазон 5 ГГц для роздачі: Параметри → Мережа й Інтернет → Мобільний хот-спот → Діапазон мережі → 5 ГГц (2.4 ГГц перевантажений і дає затримки).",
+    "Вимкніть економію живлення Wi-Fi: Диспетчер пристроїв → Мережеві адаптери → ваш Wi-Fi → Керування живленням → ЗНЯТИ 'Дозволити вимикати пристрій'.",
+    "Тримайте телефон ближче до ПК і подалі від мікрохвильовки/Bluetooth-колонок (глушать 2.4 ГГц).",
+    "Найстабільніше — той самий Wi-Fi роутер для ПК і телефону (а не роздача з ПК).",
+]
+
+
+def decide_quality(args, adb_host, use_fake_adb):
+    """Визначити профіль якості. Повертає (scrcpy_extra_args, jitter_ms).
+
+    --quality high/medium/low = примусово; auto = заміряти якщо хотспот.
+    Свій --scrcpy-args завжди поважаємо і нічого не додаємо.
+    """
+    if use_fake_adb:
+        return [], 30
+    if getattr(args, "quality", "auto") in ("medium", "low"):
+        prof = args.quality
+        extra, jitter, label = QUALITY_PROFILES[prof]
+        log(f"Якість: {prof} (примусово --quality) — {label}.")
+        if args.scrcpy_args.strip() != "--select-usb":
+            log("Свої --scrcpy-args важливіші — бітрейт не чіпаю, застосовую тільки jitter-буфер.")
+            return [], jitter
+        return list(extra), jitter
+    if getattr(args, "quality", "auto") == "high":
+        return [], 30
+    if args.scrcpy_args.strip() != "--select-usb":
+        log("Свої --scrcpy-args задано вручну — авто-якість не чіпаю.")
+        return [], 30
+    # auto
+    try:
+        is_hs, reason = detect_hotspot(adb_host)
+    except Exception:
+        is_hs, reason = False, ""
+    need_measure = is_hs or getattr(args, "measure", False)
+    if not need_measure:
+        return [], 30
+    if is_hs:
+        log(f"Виявлено роздачу інтернету з ПК (хотспот): {reason}.")
+        log("Хотспот зазвичай повільніший за роутер (2.4 ГГц + NAT) — міряю канал...")
+    else:
+        log("Міряю канал до телефону (--measure)...")
+    m = measure_link(adb_host)
+    if not m["ok"]:
+        log("Заміряти канал не вдалося (ping без відповіді) — лишаю повну якість.")
+        return [], 30
+    log(f"Канал: RTT сер.={m['rtt_avg']}мс (мін {m['rtt_min']}, макс {m['rtt_max']}), "
+        f"джиттер ~{m['jitter']}мс, втрати {m['loss']}%.")
+    prof = pick_quality_profile(m["rtt_avg"], m["loss"])
+    extra, jitter, label = QUALITY_PROFILES[prof]
+    if prof == "high":
+        log("Канал хороший — повна якість.")
+        return [], 30
+    log(f"Канал слабкий — вмикаю профіль '{prof}': {label}.")
+    log(f"scrcpy: {' '.join(extra)}; jitter-буфер приймача: {jitter}мс.")
+    if is_hs:
+        log("Поради щоб прибрати затримку на хотспоті:")
+        for t in HOTSPOT_TIPS:
+            log(f"  • {t}")
+    return list(extra), jitter
+
 
 def check_vhci():
     """Чи є драйвер vhci (для --vhci)."""
@@ -513,12 +2436,41 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--no-scrcpy", action="store_true", help="Не запускати scrcpy автоматично")
     ap.add_argument("--scrcpy-args", default="--select-usb")
+    ap.add_argument("--quality", choices=["auto", "high", "medium", "low"], default="auto",
+                    help="Якість відео: auto (сам заміряє канал на хотспоті), high/medium/low (примусово)")
+    ap.add_argument("--measure", action="store_true",
+                    help="Примусово заміряти канал (ping) і підібрати якість, навіть без хотспоту")
     ap.add_argument("--check", action="store_true", help="Тільки перевірити залежності і вийти")
     ap.add_argument("--dry-run", action="store_true", help="Тільки показати команди, нічого не запускати")
     ap.add_argument("--install-deps", action="store_true",
                     help="Самому доустановити відсутнє (cmake/adb/scrcpy) через winget")
+    ap.add_argument("--scan", action="store_true",
+                    help="Примусово просканувати всю LAN і запропонувати вибір пристрою (з назвою), "
+                         "навіть якщо телефон вже підключено")
+    ap.add_argument("--no-scan", action="store_true",
+                    help="НЕ сканувати мережу (тільки USB/last-phone/--phone-ip)")
+    ap.add_argument("--scan-timeout", type=float, default=0.45,
+                    help="Таймаут одного IP при скануванні LAN, сек (default 0.45)")
+    ap.add_argument("--pick", default="",
+                    help="Автовибір пристрою без запиту: номер зі списку або IP (для скриптів)")
+    ap.add_argument("--pair-code", default="",
+                    help="6-значний код парування з екрану (Бездротове налагодження) — без запиту")
+    ap.add_argument("--mdns-timeout", type=float, default=2.5,
+                    help="Скільки секунд слухати mDNS-анонси телефону (default 2.5)")
+    ap.add_argument("--no-wireless", action="store_true",
+                    help="НЕ пробувати підключення без кабелю (тільки USB/tcpip/скан 5555)")
+    ap.add_argument("--gui", action="store_true",
+                    help="Примусово показати вікно вибору пристрою (за замовчуванням вікно і так вискакує само)")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="Без вікна — тільки консольні запити")
+    ap.add_argument("--electron-mode", action="store_true",
+                    help="JSON event mode for Electron GUI")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.electron_mode:
+        electron_gui_mode(adb_port=args.adb_port, mdns_timeout=args.mdns_timeout, scan_timeout=args.scan_timeout)
+        return 0
 
     print("=== Virtual USB Cable — АВТОПІЛОТ (сам вводить всі команди) ===", flush=True)
 
@@ -543,6 +2495,7 @@ def main():
 
     # [1-2] телефон (крім demo)
     adb_host = "127.0.0.1"
+    adb_port_eff = args.adb_port
     use_fake_adb = False
     if args.mode == "demo":
         log("Крок 1-2: --mode demo — телефон не потрібен, буду симулювати (fake adbd).")
@@ -563,12 +2516,22 @@ def main():
             else:
                 devs = []
                 log_cmd(["adb", "devices", "-l"])
-            if args.mode == "real" and not devs and not args.phone_ip:
+            if (args.mode == "real" and not devs and not args.phone_ip
+                    and args.no_scan and args.no_wireless):
                 log("ERROR: --mode real, але 'adb devices' порожньо і --phone-ip не задано.")
-                log("Підключіть телефон по USB (і підтвердіть RSA на екрані) або задайте --phone-ip.")
+                log("Варіанти: USB-кабель, --phone-ip, або БЕЗ кабелю через Бездротове налагодження (без --no-wireless).")
                 return 2
-            adb_host, need_demo = setup_phone_wifi(args.adb_port, args.phone_ip, args.dry_run,
-                                                       devs if not args.dry_run else None)
+            # За замовчуванням: USB -> БЕЗ кабелю (mDNS + pair) -> скан LAN.
+            # --no-wireless вимикає безкабельний етап, --no-scan — скан 5555,
+            # --scan примушує показати всі пристрої навіть при наявному підключенні.
+            adb_host, adb_port_eff, need_demo = setup_phone_wifi(
+                args.adb_port, args.phone_ip, args.dry_run,
+                devs if not args.dry_run else None,
+                allow_scan=(not args.no_scan), force_scan=args.scan,
+                scan_timeout=args.scan_timeout, pick=args.pick or None,
+                allow_wireless=(not args.no_wireless),
+                mdns_timeout=args.mdns_timeout, pair_code=args.pair_code or None,
+                use_gui=args.gui or (not args.no_gui and not args.pick))
             if args.mode == "real" and need_demo and not args.dry_run:
                 # в real пробуємо ще раз показати
                 devs2 = print_adb_devices()
@@ -582,7 +2545,7 @@ def main():
     sender_bin, receiver_bin = ensure_built(args.skip_build, args.dry_run)
     if args.dry_run:
         log("(dry-run) далі тільки показую команди запуску:")
-        log_cmd(f"agent_sender --adb {adb_host}:{args.adb_port} --listen 0.0.0.0:{args.sender_port}"
+        log_cmd(f"agent_sender --adb {adb_host}:{adb_port_eff} --listen 0.0.0.0:{args.sender_port}"
                 + (" --simulate-adb" if use_fake_adb else ""))
         log_cmd(f"agent_receiver --server 127.0.0.1:{args.sender_port} --auto --simulate"
                 + (" --vhci" if args.with_vhci else ""))
@@ -590,6 +2553,11 @@ def main():
             log_cmd(f"scrcpy {args.scrcpy_args}")
         log("DRY-RUN готово.")
         return 0
+    # [3b] якість каналу (хотспот? замір? профіль scrcpy + jitter).
+    # В демо decide_quality нічого не робить (нема телефону).
+    log("Крок 3b: перевірка якості каналу (хотспот/замір)...")
+    quality_extra, jitter_ms = decide_quality(args, adb_host, use_fake_adb)
+    scrcpy_base = args.scrcpy_args.split() + quality_extra
     if not sender_bin or not receiver_bin:
         # FALLBACK: бінарників нема (нема toolchain), АЛЕ телефон вже по Wi-Fi в device —
         # даємо робоче дзеркало ВЖЕ ЗАРАЗ через звичайний scrcpy по TCP.
@@ -614,7 +2582,7 @@ def main():
             log("")
             fb = None
             try:
-                fb = subprocess.Popen(["scrcpy", "-s", tcp_serial])
+                fb = subprocess.Popen(["scrcpy", "-s", tcp_serial] + quality_extra)
                 log(f"scrcpy запущено (pid={fb.pid}). Ctrl+C щоб зупинити.")
                 while True:
                     time.sleep(1)
@@ -642,15 +2610,19 @@ def main():
 
     # [4] sender
     log("Крок 4: запускаю agent_sender САМ...")
-    sender_cmd = [sender_bin, "--adb", f"{adb_host}:{args.adb_port}",
+    sender_cmd = [sender_bin, "--adb", f"{adb_host}:{adb_port_eff}",
                   "--listen", f"0.0.0.0:{args.sender_port}"]
     if use_fake_adb:
         sender_cmd.append("--simulate-adb")
-    # sender --auto тільки для реального телефону (з fake він не потрібен)
+    # sender --auto тільки для реального телефону (з fake він не потрібен).
+    # Передаємо вже знайдений IP:порт як --phone-ip/--adb-port, щоб sender одразу
+    # підключився і НЕ перепитував/перескановував (особливо важливо для динамічного
+    # порту Бездротового налагодження).
     if not use_fake_adb:
         sender_cmd.append("--auto")
-        if args.phone_ip:
-            sender_cmd += ["--phone-ip", args.phone_ip]
+        sender_cmd += ["--phone-ip", adb_host, "--adb-port", str(adb_port_eff)]
+        if args.pair_code:
+            sender_cmd += ["--pair-code", args.pair_code]
     sender = ProcMon("SENDER", sender_cmd)
     if not sender.start():
         return 1
@@ -667,6 +2639,9 @@ def main():
         receiver_cmd.append("--simulate")
     if use_vhci:
         receiver_cmd.append("--vhci")
+    if jitter_ms != 30:
+        # Старі бінарники невідомий прапорець мовчки ігнорують — безпечно
+        receiver_cmd += ["--jitter-ms", str(jitter_ms)]
     receiver = ProcMon("RECEIVER", receiver_cmd)
     if not receiver.start():
         sender.stop()
@@ -689,9 +2664,9 @@ def main():
         if not has_scrcpy:
             log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: winget install Genymobile.scrcpy")
         else:
-            log(f"Крок 7: запускаю scrcpy САМ: scrcpy {args.scrcpy_args} ...")
+            log(f"Крок 7: запускаю scrcpy САМ: scrcpy {' '.join(scrcpy_base)} ...")
             try:
-                scrcpy_proc = subprocess.Popen(["scrcpy"] + args.scrcpy_args.split())
+                scrcpy_proc = subprocess.Popen(["scrcpy"] + scrcpy_base)
                 log(f"scrcpy запущено (pid={scrcpy_proc.pid}).")
             except FileNotFoundError:
                 log("Не вдалося запустити scrcpy.")
@@ -728,6 +2703,183 @@ def main():
                 pass
         log("Зупинено. До побачення!")
     return 0
+
+
+def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=0.45):
+    """GUI режим для Electron: JSON events через stdout / команди через stdin."""
+    import json
+    import sys
+    import threading
+
+    def emit(event_type, data):
+        try:
+            payload = json.dumps({'event': event_type, 'data': data}, ensure_ascii=False)
+            print(payload, flush=True)
+        except Exception as ex:
+            print(f"[ERROR] emit {event_type}: {ex}", file=sys.stderr, flush=True)
+
+    seen_devices = {}
+    dev_lock = threading.Lock()
+
+    def report_device(device):
+        key = (device.get('kind', 'lan'), device.get('ip'), device.get('port'))
+        with dev_lock:
+            if key in seen_devices:
+                old = seen_devices[key]
+                if old.get('name') == "опитування..." and device.get('name') != "опитування...":
+                    seen_devices[key] = device
+                else:
+                    return
+            else:
+                if device.get('kind') == 'lan' and any(d.get('ip') == device.get('ip') and d.get('kind') == 'connect' for d in seen_devices.values()):
+                    return
+                seen_devices[key] = device
+
+        emit('device-found', {
+            'ip': device['ip'],
+            'port': device['port'],
+            'name': device.get('name', 'Android Device'),
+            'kind': device.get('kind', 'lan'),
+            'state': device.get('state', 'device')
+        })
+
+    def run_full_scan():
+        emit('status-update', 'Шукаю пристрої по mDNS та в мережі...')
+        # 0) Останній відомий пристрій
+        last = load_last_phone()
+        if last:
+            lip, lport = _split_serial(last, adb_port)
+            if lip and _tcp_port_open(lip, lport, 0.4):
+                name = get_device_display_name(f"{lip}:{lport}")
+                report_device({
+                    'kind': 'connect',
+                    'ip': lip,
+                    'port': lport,
+                    'name': name if name and 'невідома' not in name else f"Останній ({lip})",
+                    'state': 'device'
+                })
+
+        # 1) mDNS (Бездротове налагодження)
+        try:
+            mdevs = mdns_discover_adb(timeout=mdns_timeout)
+            for d in mdevs:
+                host = (d.get("host") or d.get("instance") or "").replace(".local", "")
+                ip = d["ips"][0] if d.get("ips") else ""
+                if not ip:
+                    continue
+                item = {
+                    "kind": d["kind"],
+                    "ip": ip,
+                    "port": d["port"],
+                    "name": host or "Android Device",
+                    "state": "device"
+                }
+                if d["kind"] == "connect":
+                    try:
+                        name = get_device_display_name(f"{ip}:{d['port']}")
+                        if name and "невідома" not in name:
+                            item["name"] = name
+                    except Exception:
+                        pass
+                report_device(item)
+        except Exception as e:
+            emit('status-update', f'mDNS: {e}')
+
+        # 2) LAN-сканування
+        def lan_open(ip):
+            report_device({
+                "kind": "lan",
+                "ip": ip,
+                "port": adb_port,
+                "name": "опитування...",
+                "state": "device"
+            })
+
+        def lan_named(info):
+            report_device({
+                "kind": "lan",
+                "ip": info["ip"],
+                "port": adb_port,
+                "name": info.get("name", "Android Device"),
+                "state": info.get("state", "device")
+            })
+
+        try:
+            scan_lan_with_names(
+                adb_port=adb_port,
+                timeout=scan_timeout,
+                on_port_open=lan_open,
+                on_found=lan_named
+            )
+        except Exception as e:
+            emit('status-update', f'LAN скан: {e}')
+
+        emit('scan-progress', {'done': True, 'count': len(seen_devices)})
+        emit('status-update', f'Пошук завершено. Знайдено {len(seen_devices)} пристроїв.')
+
+    # Початковий запуск сканування
+    threading.Thread(target=run_full_scan, daemon=True).start()
+
+    # Читання команд від Electron через stdin
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+            cmd_type = cmd.get('type')
+            if cmd_type == 'scan':
+                with dev_lock:
+                    seen_devices.clear()
+                threading.Thread(target=run_full_scan, daemon=True).start()
+            elif cmd_type == 'connect':
+                ip = cmd['ip']
+                port = int(cmd.get('port', adb_port))
+                emit('status-update', f'Підключення до {ip}:{port}...')
+                def do_connect(tip=ip, tport=port):
+                    result = adb_connect_fast(tip, tport)
+                    name = get_device_display_name(f"{tip}:{tport}") if result else ""
+                    if result:
+                        save_last_phone(f"{tip}:{tport}")
+                    emit('connect-result', {
+                        'success': bool(result),
+                        'ip': tip,
+                        'port': tport,
+                        'name': name,
+                        'error': '' if result else 'Не вдалося підключитися'
+                    })
+                    emit('status-update', f'Підключено до {tip}:{tport}' if result else f'Помилка підключення до {tip}:{tport}')
+                threading.Thread(target=do_connect, daemon=True).start()
+            elif cmd_type == 'pair':
+                ip = cmd['ip']
+                port = int(cmd['port'])
+                code = str(cmd['code']).strip()
+                emit('status-update', f'Парування з {ip}:{port}...')
+                def do_pair(tip=ip, tport=port, tcode=code):
+                    result = adb_pair_verify(tip, tport, tcode)
+                    if result:
+                        emit('pair-result', {'success': True, 'ip': tip, 'port': tport})
+                        emit('status-update', 'Успішно спаровано! Шукаю порт підключення...')
+                        try:
+                            devs = mdns_discover_adb(timeout=2.0)
+                            same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == tip]
+                            if same:
+                                cp = same[0]["port"]
+                                conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
+                                name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
+                                if conn_ok:
+                                    save_last_phone(f"{tip}:{cp}")
+                                emit('connect-result', {'success': bool(conn_ok), 'ip': tip, 'port': cp, 'name': name})
+                                emit('status-update', f'Підключено БЕЗ кабелю: {tip}:{cp} — {name}' if conn_ok else 'Не вдалося підключитися до порту підключення.')
+                                return
+                        except Exception:
+                            pass
+                    else:
+                        emit('pair-result', {'success': False, 'ip': tip, 'port': tport, 'error': 'Парування не вдалося'})
+                        emit('status-update', 'Парування не вдалося. Перевірте код.')
+                threading.Thread(target=do_pair, daemon=True).start()
+        except Exception as e:
+            emit('error', {'message': str(e)})
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ target_link_libraries(agent_receiver PRIVATE common)
 target_include_directories(agent_receiver PRIVATE src/common)
 
 if(WIN32)
-    target_link_libraries(agent_receiver PRIVATE ws2_32 wsock32 setupapi)
+    target_link_libraries(agent_receiver PRIVATE ws2_32 setupapi)
     # Для msquic (QUIC) — розкоментувати коли буде встановлено msquic
     # find_package(msquic CONFIG REQUIRED)
     # target_link_libraries(agent_receiver PRIVATE msquic)
@@ -53,7 +53,7 @@ target_link_libraries(agent_sender PRIVATE common)
 target_include_directories(agent_sender PRIVATE src/common)
 
 if(WIN32)
-    target_link_libraries(agent_sender PRIVATE ws2_32 wsock32)
+    target_link_libraries(agent_sender PRIVATE ws2_32)
 endif()
 
 # Android NDK — фейковий таргет для перевірки крос-компіляції
@@ -62,28 +62,19 @@ endif()
 # Тести
 if(BUILD_TESTS)
     enable_testing()
-    add_executable(test_fec
-        tests/test_fec.cpp
-        src/common/fec.cpp
-    )
-    target_include_directories(test_fec PRIVATE src/common)
-    add_test(NAME test_fec COMMAND test_fec)
 
-    add_executable(test_protocol
-        tests/test_protocol.cpp
-    )
-    target_include_directories(test_protocol PRIVATE src/common)
-    add_test(NAME test_protocol COMMAND test_protocol)
+    add_executable(test_fec tests/test_fec.cpp)
+    target_link_libraries(test_fec PRIVATE common)
 
-    add_executable(test_ringbuf
-        tests/test_ringbuf.cpp
-    )
-    target_include_directories(test_ringbuf PRIVATE src/common)
-    add_test(NAME test_ringbuf COMMAND test_ringbuf)
+    add_executable(test_protocol tests/test_protocol.cpp)
+    target_link_libraries(test_protocol PRIVATE common)
+
+    add_executable(test_ringbuf tests/test_ringbuf.cpp)
+    target_link_libraries(test_ringbuf PRIVATE common)
 endif()
 
 # Інфо
-message(STATUS "=== scrcpy-wifi-moduel ===")
+message(STATUS "=== scrcpy-wifi-module ===")
 message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

@@ -1,0 +1,14 @@
+{
+  "name": "scrcpy-wifi-cable",
+  "version": "1.0.0",
+  "description": "Virtual USB Cable & scrcpy Wireless Manager UI",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}

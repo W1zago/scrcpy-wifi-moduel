@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html class="dark" lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta content="width=device-width, initial-scale=1.0" name="viewport">
+  <title>Virtual USB Cable</title>
+  <link href="https://fonts.googleapis.com" rel="preconnect">
+  <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            app: '#0f0f1a',
+            card: '#1a1a2e',
+            'card-hover': '#21213b',
+            accent: '#6366f1',
+            'accent-hover': '#4f46e5',
+            'accent-light': '#818cf8',
+            dim: '#9ca3af',
+            bordercol: '#27273f',
+            'bordercol-subtle': '#1f1f38',
+            success: '#22c55e',
+            danger: '#ef4444'
+          },
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace']
+          },
+          keyframes: {
+            scanLine: {
+              '0%': { transform: 'translateX(-100%)' },
+              '50%': { transform: 'translateX(80%)' },
+              '100%': { transform: 'translateX(220%)' }
+            }
+          },
+          animation: {
+            'scan-line': 'scanLine 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite'
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body {
+      user-select: none;
+      -webkit-user-select: none;
+      background-color: #0b0b13;
+    }
+  </style>
+</head>
+<body class="w-screen h-screen overflow-hidden text-white font-sans antialiased bg-app selection:bg-accent selection:text-white m-0 p-0 flex flex-col">
+
+  <!-- Desktop Frameless Window Container (700 x 600) -->
+  <div class="relative w-full h-full bg-app flex flex-col overflow-hidden border border-bordercol">
+
+    <!-- Titlebar (Draggable Chrome) -->
+    <header class="h-10 px-3 bg-app border-b border-bordercol-subtle flex items-center justify-between shrink-0 select-none titlebar-drag">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-accent text-[18px]">cable</span>
+        <span class="text-xs font-semibold tracking-wide text-white">Virtual USB Cable</span>
+        <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-emerald-500/10 text-success border border-emerald-500/20 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span>
+          ONLINE
+        </span>
+      </div>
+
+      <!-- Windows-style Window Controls -->
+      <div class="flex items-center -mr-1 no-drag">
+        <button id="btn-minimize" class="w-9 h-7 flex items-center justify-center text-dim hover:text-white hover:bg-white/5 transition-colors" title="Згорнути">
+          <span class="material-symbols-outlined text-[15px]">remove</span>
+        </button>
+        <button id="btn-maximize" class="w-9 h-7 flex items-center justify-center text-dim hover:text-white hover:bg-white/5 transition-colors" title="Розгорнути">
+          <span class="material-symbols-outlined text-[13px]">crop_square</span>
+        </button>
+        <button id="btn-close" class="w-9 h-7 flex items-center justify-center text-dim hover:text-white hover:bg-danger/80 transition-colors" title="Закрити">
+          <span class="material-symbols-outlined text-[15px]">close</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Scanning & Status Bar -->
+    <div class="px-5 pt-3 pb-2.5 bg-app shrink-0">
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="material-symbols-outlined text-accent text-[18px]">search</span>
+          <span class="text-[13px] font-medium text-white truncate" id="scan-status-text">Пошук телефонів у локальній мережі...</span>
+        </div>
+        <button id="rescan-btn" class="no-drag px-2.5 py-1 rounded-md bg-card hover:bg-card-hover border border-bordercol text-dim hover:text-white text-xs font-medium flex items-center gap-1.5 transition-colors active:scale-95 shrink-0" title="Оновити список">
+          <span class="material-symbols-outlined text-[15px] transition-transform duration-500" id="rescan-icon">refresh</span>
+          <span>Оновити</span>
+        </button>
+      </div>
+      <!-- Minimal Animated Scan Progress Line -->
+      <div class="w-full h-0.5 bg-bordercol-subtle rounded-full overflow-hidden mt-2.5">
+        <div class="w-1/3 h-full bg-accent rounded-full animate-scan-line" id="scan-progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Scrollable Content Area -->
+    <main class="flex-1 px-5 py-2.5 overflow-y-auto custom-scrollbar flex flex-col gap-3">
+      <!-- Section Label -->
+      <div class="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-dim px-0.5 pt-1">
+        <span id="device-count-label">Знайдені пристрої (0)</span>
+        <span class="text-[10px] text-dim/80">ADB порт: 5555</span>
+      </div>
+
+      <!-- Dynamic Device List Container -->
+      <div id="device-list" class="flex flex-col gap-3">
+        <!-- Devices rendered dynamically via renderer.js -->
+      </div>
+
+      <!-- Empty state placeholder -->
+      <div id="no-devices-msg" class="py-8 flex flex-col items-center justify-center text-dim text-xs gap-2">
+        <span class="material-symbols-outlined text-3xl text-dim/30">phonelink_ring</span>
+        <span id="no-devices-text">Шукаю доступні пристрої у Wi-Fi мережі...</span>
+      </div>
+
+      <!-- Manual Entry Section (+ Вручну) -->
+      <div class="device-card-lift bg-card rounded-lg border border-bordercol overflow-hidden">
+        <button id="btn-toggle-manual" class="w-full p-3 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors">
+          <div class="flex items-center gap-2 text-xs font-medium text-white">
+            <span class="material-symbols-outlined text-dim text-[16px]">add_circle_outline</span>
+            <span>Вручну (IP / Порт / Код)</span>
+          </div>
+          <span class="material-symbols-outlined text-dim text-[18px] transition-transform duration-200" id="manual-chevron">expand_more</span>
+        </button>
+        <div class="max-h-0 overflow-hidden transition-all duration-200 ease-out bg-app/50 border-t border-transparent" id="manual-drawer">
+          <div class="p-3.5 flex flex-col gap-3">
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="block text-[10px] font-mono uppercase text-dim mb-1">IP-адреса</label>
+                <input id="manual-ip" class="w-full h-8 px-2.5 rounded bg-card border border-bordercol text-white font-mono text-xs focus:outline-none focus:border-accent" type="text" placeholder="192.168.1.100">
+              </div>
+              <div>
+                <label class="block text-[10px] font-mono uppercase text-dim mb-1">Порт</label>
+                <input id="manual-port" class="w-full h-8 px-2.5 rounded bg-card border border-bordercol text-white font-mono text-xs focus:outline-none focus:border-accent" type="text" value="5555">
+              </div>
+              <div>
+                <label class="block text-[10px] font-mono uppercase text-dim mb-1">Код (опц.)</label>
+                <input id="manual-code" class="w-full h-8 px-2.5 rounded bg-card border border-bordercol text-white font-mono text-xs focus:outline-none focus:border-accent text-center" placeholder="6 цифр" maxlength="6" type="text">
+              </div>
+            </div>
+            <div class="flex justify-end pt-0.5">
+              <button id="manual-connect-btn" class="h-8 px-3 rounded-md bg-accent hover:bg-accent-hover text-white text-xs font-semibold transition-all active:scale-95 flex items-center gap-1">
+                <span class="material-symbols-outlined text-[14px]">link</span>
+                <span>Підключити</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Bottom Action Area -->
+    <footer class="h-9 px-5 bg-app/60 border-t border-bordercol-subtle flex items-center justify-between shrink-0 select-none text-[11px] font-mono text-dim">
+      <div class="flex items-center gap-2">
+        <span class="flex items-center gap-1.5 text-success">
+          <span class="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span>
+          <span>ADB Bridge</span>
+        </span>
+        <span class="text-bordercol">|</span>
+        <span class="text-dim/80">Порт 5555 активний</span>
+      </div>
+      <div class="flex items-center gap-3 text-dim/80">
+        <span class="flex items-center gap-1">
+          <span class="material-symbols-outlined text-[13px] text-accent-light">wifi</span>
+          <span>Wi-Fi Discovery</span>
+        </span>
+        <span class="text-bordercol">•</span>
+        <span id="footer-status">Готовий</span>
+      </div>
+    </footer>
+
+    <!-- Snappy Toast Feedback Notification -->
+    <div class="absolute bottom-16 left-1/2 -translate-x-1/2 pointer-events-none opacity-0 translate-y-2 transition-all duration-200 z-50" id="toast">
+      <div class="px-3.5 py-1.5 rounded-md bg-card border border-bordercol text-white text-xs font-medium shadow-xl flex items-center gap-2">
+        <span id="toast-text">Сповіщення</span>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

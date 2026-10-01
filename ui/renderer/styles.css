@@ -1,0 +1,47 @@
+/* Window Dragging for Frameless Window */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.no-drag,
+button,
+input,
+select,
+textarea,
+a,
+span.material-symbols-outlined {
+  -webkit-app-region: no-drag !important;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #27273f;
+  border-radius: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #3b3b5c;
+}
+
+/* Card hover animation */
+.device-card-lift {
+  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.device-card-lift:hover {
+  transform: translateY(-2px);
+  border-color: #3b3b5c;
+  box-shadow: 0 8px 20px -4px rgba(0, 0, 0, 0.45);
+}

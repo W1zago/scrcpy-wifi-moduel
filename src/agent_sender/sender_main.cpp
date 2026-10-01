@@ -181,14 +181,22 @@ void print_usage(const char* prog) {
     printf("  --listen <host:port>   WAN listen address (default 0.0.0.0:22777)\n");
     printf("  --simulate-adb         Run fake adbd on --adb port (for Windows test)\n");
     printf("  --auto                САМ вводить всі команди: adb start-server, adb tcpip,\n");
-    printf("                        визначення IP телефону, adb connect. Нічого вводити не треба.\n");
+    printf("                        визначення IP телефону, СКАНУВАННЯ всієї LAN зі списком\n");
+    printf("                        'IP — назва пристрою' і вибором. Нічого вводити не треба.\n");
     printf("  --phone-ip <ip>       IP телефону (якщо автовизначення не спрацювало)\n");
     printf("  --adb-port <port>     Порт tcpip (default 5555)\n");
+    printf("  --scan                Примусово просканувати LAN і запропонувати вибір,\n");
+    printf("                        навіть якщо телефон вже підключено\n");
+    printf("  --no-scan             НЕ шукати в мережі (тільки USB/--phone-ip)\n");
+    printf("  --pick <N|IP>         Автовибір пристрою без запиту (номер зі списку або IP)\n");
+    printf("  --pair-code <код>     6-значний код парування (Бездротове налагодження без кабелю)\n");
     printf("  --help                 Show help\n");
     printf("\nExamples:\n");
     printf("  Android: %s --adb 127.0.0.1:5555 --listen 0.0.0.0:22777\n", prog);
     printf("  Windows sim: %s --simulate-adb --adb 127.0.0.1:5555 --listen 0.0.0.0:22777\n", prog);
     printf("  AUTO (реальний телефон по USB): %s --auto --listen 0.0.0.0:22777\n", prog);
+    printf("  AUTO (скан мережі + вибір): %s --auto --scan\n", prog);
+    printf("  AUTO (БЕЗ кабелю, Android 11+): %s --auto  (підкаже що ввести з екрану)\n", prog);
     printf("  AUTO (демо без телефону): %s --auto --simulate-adb\n", prog);
 }
 
@@ -200,6 +208,10 @@ int main(int argc, char* argv[]) {
     bool simulate_adb = false;
     bool auto_mode = false;
     std::string phone_ip_override;
+    bool force_scan = false;
+    bool allow_scan = true;
+    std::string pick;
+    std::string pair_code;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--adb") == 0 && i+1 < argc) {
@@ -230,6 +242,14 @@ int main(int argc, char* argv[]) {
             phone_ip_override = argv[++i];
         } else if (strcmp(argv[i], "--adb-port") == 0 && i+1 < argc) {
             adb_port = (uint16_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--scan") == 0) {
+            force_scan = true;
+        } else if (strcmp(argv[i], "--no-scan") == 0) {
+            allow_scan = false;
+        } else if (strcmp(argv[i], "--pick") == 0 && i+1 < argc) {
+            pick = argv[++i];
+        } else if (strcmp(argv[i], "--pair-code") == 0 && i+1 < argc) {
+            pair_code = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -255,15 +275,17 @@ int main(int argc, char* argv[]) {
             auto_hbuf[sizeof(auto_hbuf)-1] = '\0';
             adb_host = auto_hbuf;
         } else {
-            // Повний ланцюжок USB -> tcpip -> connect
-            std::string conn = autosetup::AutoSetupPhoneWifi(adb_port);
+            // Повний ланцюжок: USB -> tcpip -> connect, БЕЗ кабелю (pair), скан LAN.
+            // conn = "ip:port" (порт може бути динамічним від Бездротового налагодження!).
+            std::string conn = autosetup::AutoSetupPhoneWifi(adb_port, allow_scan, force_scan, pick,
+                                                             600, pair_code);
             if (!conn.empty() && conn.find(':') != std::string::npos) {
-                // conn = "ip:port" — беремо ip для adb_host
                 auto colon = conn.find(':');
                 static char auto_hbuf2[256];
                 strncpy(auto_hbuf2, conn.substr(0, colon).c_str(), sizeof(auto_hbuf2)-1);
                 auto_hbuf2[sizeof(auto_hbuf2)-1] = '\0';
                 adb_host = auto_hbuf2;
+                adb_port = (uint16_t)atoi(conn.substr(colon + 1).c_str());
                 printf("[AUTO] Телефон готовий: %s (adbd %s:%u)\n", conn.c_str(), adb_host, adb_port);
             } else {
                 printf("[AUTO] Телефон по Wi-Fi не налаштовано. Якщо телефону нема — перезапустіть з --simulate-adb.\n");

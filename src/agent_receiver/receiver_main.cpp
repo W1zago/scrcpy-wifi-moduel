@@ -143,6 +143,9 @@ static UrbPool      g_pool;
 static FecDecoder   g_fec_decoder;
 static std::atomic<bool> g_running{true};
 static std::atomic<uint32_t> g_seqnum{100};
+// Jitter-буфер в мс (default JITTER_BUFFER_MS=30; на повільному каналі/хотспоті
+// auto_run.py передає більше через --jitter-ms, щоб згладити джиттер WAN)
+static unsigned g_jitter_ms = JITTER_BUFFER_MS;
 
 // Jitter buffer — затримує IN URB на 30мс перед віддачею в vhci
 struct JitterEntry {
@@ -243,13 +246,13 @@ void network_to_vhci_loop(TcpTransport* transport) {
                 if (is_parity) continue; // паритет не віддаємо в vhci напряму
             }
 
-            // Jitter buffer: якщо IN і has_wan — затримуємо 30мс
+            // Jitter buffer: якщо IN і has_wan — затримуємо на g_jitter_ms
             if (has_wan && ntoh32(ret->direction) == 1) {
                 LARGE_INTEGER qpc, freq;
                 QueryPerformanceCounter(&qpc);
                 QueryPerformanceFrequency(&freq);
                 uint64_t now_us = (qpc.QuadPart * 1000000ull) / freq.QuadPart;
-                uint64_t ready_us = wan.timestamp_us + JITTER_BUFFER_MS * 1000;
+                uint64_t ready_us = wan.timestamp_us + (uint64_t)g_jitter_ms * 1000;
                 if (ready_us > now_us) {
                     // Кладемо в jitter buffer
                     JitterEntry je;
@@ -300,7 +303,7 @@ void network_to_vhci_loop(TcpTransport* transport) {
 // ============================================================================
 
 void jitter_loop() {
-    printf("[JITTER] Jitter thread started (30ms buffer)\n");
+    printf("[JITTER] Jitter thread started (%ums buffer)\n", g_jitter_ms);
     while (g_running) {
         JitterEntry je;
         if (!g_jitter_buf.pop(je)) {
@@ -446,6 +449,7 @@ void print_usage(const char* prog) {
     printf("                        adb devices, автозапуск scrcpy. Нічого вводити вручну не треба.\n");
     printf("  --no-scrcpy           Не запускати scrcpy автоматично (навіть з --auto)\n");
     printf("  --scrcpy-args \"...\"   Аргументи для scrcpy (default \"--select-usb\")\n");
+    printf("  --jitter-ms <N>       Jitter-буфер в мс (default 30; на хотспоті/повільному Wi-Fi 60-100)\n");
     printf("  --help                Show this help\n");
     printf("\nExamples:\n");
     printf("  %s --auto --simulate                      (демо без телефону, все само)\n", prog);
@@ -487,6 +491,11 @@ int main(int argc, char* argv[]) {
             auto_scrcpy = false;
         } else if (strcmp(argv[i], "--scrcpy-args") == 0 && i+1 < argc) {
             scrcpy_args = argv[++i];
+        } else if (strcmp(argv[i], "--jitter-ms") == 0 && i+1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 0) v = 0;
+            if (v > 500) v = 500;
+            g_jitter_ms = (unsigned)v;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -494,9 +503,9 @@ int main(int argc, char* argv[]) {
     }
 
     printf("=== Virtual USB Cable — Agent-Receiver (Windows) ===\n");
-    printf("Server: %s:%u  VHCI: %s  Simulate: %s  Auto: %s\n",
+    printf("Server: %s:%u  VHCI: %s  Simulate: %s  Auto: %s  Jitter: %ums\n",
            server_host, server_port, use_vhci ? "yes" : "no", simulate ? "yes" : "no",
-           auto_mode ? "yes" : "no");
+           auto_mode ? "yes" : "no", g_jitter_ms);
 
     // --- AUTO: сам вводимо всі команди ---
     if (auto_mode) {
