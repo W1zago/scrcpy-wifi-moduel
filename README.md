@@ -1,193 +1,162 @@
-# scrcpy-wifi-moduel — Virtual USB Cable (Kernel-Level)
+# scrcpy-wifi-module
 
-Повноцінна архітектура рівня ядра для передачі USB-пакетів `scrcpy` через Wi-Fi/Internet з емуляцією фізичного USB на Windows Host.
+<p align="left">
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License" height="20">
+  <img src="https://img.shields.io/badge/Platform-Windows-blue.svg?style=flat-square" alt="Platform" height="20">
+  <img src="https://img.shields.io/badge/scrcpy-compatible-brightgreen.svg?style=flat-square" alt="Scrcpy" height="20">
+</p>
 
-> **Детальна архітектура:** див. [ARCHITECTURE.md](ARCHITECTURE.md) — 8 розділів, Mermaid діаграми, порівняння VHCI vs UsbDk, QUIC vs TCP, GHOST mode.
+> **Virtual USB-over-IP Cable Bridge for scrcpy**  
+> High-performance transport layer that relays ADB & USB packets over Wi-Fi, emulating a physical USB Android connection on Windows Host.
 
-## Автозапуск однією командою (нічого вводити вручну не треба)
+---
 
-Програма **сама вводить всі команди**: `adb start-server`, `adb tcpip`, `adb connect`, визначення IP телефону, збірку, запуск sender+receiver і `scrcpy`.
+## 📌 Overview
+
+**scrcpy-wifi-module** is an automated network transport bridge designed to eliminate physical USB tethering while using [scrcpy](https://github.com/Genymobile/scrcpy). By tunneling Android USB packets over Wi-Fi and managing low-level host device bindings, it allows seamless, low-latency screen mirroring and device control.
+
+---
+
+## ✨ Key Features
+
+- ⚡ **Zero-Configuration Launcher**: Auto-detects local Android devices, handles IP lookup, and starts `scrcpy` in one step.
+- 📶 **Wireless ADB Pairing (Android 11+)**: Built-in mDNS discovery for automatic pairing and instant reconnection without requiring initial USB cabling.
+- 🎯 **Virtual USB Emulation**: Emulates host-side USB device bindings to maintain reliable communication.
+- 📊 **Adaptive Streaming & Telemetry**: Dynamic network analysis (ping, jitter, loss measurement) that auto-adjusts bitrate, resolution, and frame rates for Wi-Fi hotspots or unstable networks.
+- 🔄 **State Persistence**: Remembers previously paired devices for background auto-reconnect.
+- 🧪 **Simulation Mode**: Integrated test environment with mock ADB daemons for testing without physical hardware.
+
+---
+
+## 🏗️ Principle of Operation
+
+`scrcpy-wifi-module` orchestrates the complete lifecycle of a virtual USB-over-IP connection through three main layers: discovery & telemetry, virtual host driver emulation, and client execution.
+
+### Architecture Overview
+
+```mermaid
+flowchart TD
+    subgraph Device ["Android Device Layer"]
+        ADBD["ADB Daemon (adbd)"]
+        mDNS["mDNS Wireless Pairing Service"]
+    end
+
+    subgraph Network ["Transport & Telemetry Layer"]
+        Discovery["Device Discovery & Pairing Manager"]
+        NetworkEngine["Transport & Jitter Control Engine"]
+        Telemetry["Link Metrics & Adaptive Quality Resolver"]
+    end
+
+    subgraph Host ["Windows Host Emulation Layer"]
+        VHCI["Virtual USB Host Controller (VHCI)"]
+        ScrcpyClient["scrcpy Client Instance"]
+    end
+
+    Device -->|Broadcasts Service| Discovery
+    Discovery -->|Establishes Socket| NetworkEngine
+    Telemetry -->|Monitors RTT & Loss| NetworkEngine
+    NetworkEngine -->|Encapsulates URB Packets| VHCI
+    VHCI -->|Exposes Virtual USB Bus| ScrcpyClient
+```
+
+### Execution & Control Workflow
+
+When a connection is initiated, the system executes the following operational pipeline:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as Automation Launcher
+    participant Discovery as mDNS & Wireless Resolver
+    participant Transport as Network Transport Layer
+    participant Driver as Virtual USB Controller
+    participant Scrcpy as scrcpy Client Process
+
+    User->>App: Launch Connection (START.bat)
+    App->>Discovery: Discover Wireless Devices (mDNS/Pairing)
+    Discovery-->>App: Device IP & Port Resolved
+    App->>Transport: Initialize Transport & Telemetry Engine
+    Transport->>Driver: Bind Virtual USB Device Descriptors
+    Driver-->>App: Virtual USB Device Ready (VID_18D1)
+    App->>Scrcpy: Spawn scrcpy Instance
+    activate Scrcpy
+    Scrcpy->>Driver: Issue USB IOCTL Bulk Requests
+    Driver->>Transport: Bridge Packet Stream over Network
+    Transport->>Scrcpy: Stream H.264/H.265 Frame Packets
+    User->>Scrcpy: Terminate Session
+    Scrcpy-->>App: Process Exit
+    deactivate Scrcpy
+    App->>Transport: Close Socket & Unbind Virtual USB
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- **Host OS**: Windows 10/11 (64-bit)
+- **Dependencies**:
+  - `Python 3.8+`
+  - `CMake 3.15+`
+  - `scrcpy` and `adb` available in system `PATH`
+
+---
+
+### Basic Usage
+
+#### Option A: One-Click Auto Run (Recommended)
+
+Run via Windows script:
+
+```cmd
+START.bat
+```
+
+#### Option B: Advanced Command Line Interface
 
 ```powershell
-# Варіант A — подвійний клік (найпростіше)
-START.bat                # авто: реальний телефон якщо є, інакше демо
-START.bat demo           # демо без телефону (fake adbd, все симулюється)
-START.bat real           # вимагає телефон (помилка якщо не знайдено)
+# Auto-detect local phone and start scrcpy
+python tools/auto_run.py
 
-# Варіант B — з консолі (ті самі можливості + опції)
-python tools/auto_run.py                       # = START.bat
-python tools/auto_run.py --mode demo           # без телефону
-python tools/auto_run.py --mode real --phone-ip 192.168.1.100  # телефон за IP
-python tools/auto_run.py --check               # тільки перевірка залежностей (+ компілятор)
-python tools/auto_run.py --dry-run             # тільки показати команди, нічого не запускати
-python tools/auto_run.py --install-deps        # самому доустановити cmake/adb/scrcpy через winget
-python tools/auto_run.py --with-vhci           # спробувати справжній vhci.sys
-python tools/auto_run.py --no-scrcpy           # не запускати scrcpy автоматично
-START.bat install                              # те саме що --install-deps (подвійний клік)
+# Wireless pair via 6-digit Android code
+python tools/auto_run.py --pair-code 123456
+
+# Force quality profile (Ideal for 2.4 GHz Wi-Fi / Hotspots)
+python tools/auto_run.py --quality low
+
+# Run simulation test environment (No phone connected)
+python tools/auto_run.py --mode demo
 ```
 
-Автопілот запам'ятовує останній робочий пристрій у `build/last_phone.txt`. Якщо телефон
-завис у `tcpip`-режимі з минулого запуску (USB порожній), скрипт сам пробує `adb reconnect`
-і перепідключення до запам'ятованого IP — кабель смикати не треба.
+---
 
-### Якщо `adb connect` не проходить (таймаут 10060)
+## 🛠️ Performance Tuning
 
-Автопілот сам: визначає IP **до** `adb tcpip` (поки USB живий), збирає всіх кандидатів
-(спочатку `wlan0`, потім `src` з route), кожного перевіряє 3 рази і друкує діагностику.
-Якщо `adb devices` порожній — сам пробує `adb reconnect` і останній запам'ятований IP.
-Найчастіші причини:
+For minimum latency and high-framerate performance:
 
-1. Телефон НЕ в тій самій Wi-Fi мережі, що ПК (IP на кшталт `10.x` — це мобільні дані, а не LAN).
-   Увімкніть Wi-Fi на телефоні і підключіться до того ж роутера.
-2. Вимкнене *Бездротове налагодження* (Параметри → Для розробників).
-3. AP isolation в роутері / брандмауер Windows ріже порт 5555 (`ping <IP>` для перевірки).
-4. IP не визначився сам — задайте вручну: `--phone-ip <IP з Налаштування → Про телефон → Статус>`.
+1. **5 GHz Band**: Ensure both the PC and Android device are connected to a 5 GHz Wi-Fi network.
+2. **Mobile Hotspot**: If using Windows Hotspot, configure the band to 5 GHz and disable *Power Saving* options for the host network adapter.
+3. **Quality Profile**: Use `--quality low` or `--quality medium` on congested wireless networks to prevent buffer bloat.
 
-### Для збірки C++ потрібні (одноразово)
+---
 
-- `winget install Kitware.CMake` (або `--install-deps`)
-- Компілятор MSVC (3–8 ГБ, 10–30 хв, одноразово):
-  `winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
-- `python tools/auto_run.py --check` покаже чого не вистачає.
+## 📂 Project Structure
 
-Що автопілот робить САМ, по кроках:
-
-| Крок | Команда (вводиться автоматично) |
-|---|---|
-| 0 | Перевірка `adb`, `scrcpy`, `cmake` (підказує `winget install ...` якщо нема) |
-| 1 | `adb start-server` |
-| 2 | `adb devices -l` → якщо USB: `adb tcpip 5555` → `adb shell ip route` (IP) → `adb connect IP:5555` |
-| 3 | `cmake -B build` + `cmake --build build --config Release` (якщо бінарників нема; cmake доустановить сам через winget, може попросити UAC). Без компілятора MSVC — чесна помилка + інструкція |
-| 3b | **Fallback**: якщо зібрати нема чим, а телефон вже по Wi-Fi в `device` — запускає звичайний `scrcpy -s IP:5555` по TCP (не віртуальний USB, але дзеркало працює одразу) |
-| 4 | Запуск `agent_sender` (з `--simulate-adb` в демо, з `--auto` для реального телефону) |
-| 5 | Запуск `agent_receiver --auto` (сам робить `adb devices`, перевіряє VHCI) |
-| 6 | Пауза + контрольний `adb devices` |
-| 7 | Запуск `scrcpy --select-usb` |
-| 8 | `Ctrl+C` → коректна зупинка всіх процесів |
-
-Окремо бінарники теж вміють `--auto` (кожен сам вводить свої команди):
-
-```powershell
-.\build\Release\agent_sender.exe --auto --listen 0.0.0.0:22777
-# сам: adb start-server, adb tcpip 5555, визначення IP, adb connect
-
-.\build\Release\agent_receiver.exe --auto --simulate
-# сам: adb start-server, перевірка vhci/testsigning, adb devices, запуск scrcpy
-.\build\Release\agent_receiver.exe --auto --vhci --server 192.168.1.100:22777
+```text
+scrcpy-wifi-module/
+├── src/                # Core C/C++ engine, driver interop, and network stack
+├── ui/                 # Status GUI, connection dialogs, and monitor widgets
+├── tools/              # CLI runner, automation tools, and network utilities
+├── scripts/            # Build utilities and helper scripts
+├── tests/              # Unit tests, mock daemons, and simulation suites
+├── CMakeLists.txt      # Root CMake configuration
+└── START.bat           # Launcher script for Windows
 ```
 
-### Одноразове налаштування Windows (все само)
+---
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1
-# сам: winget install cmake/adb/scrcpy, перевірка Test Signing,
-#      скачування+встановлення usbip-win2, adb start-server + adb devices
-```
+## 📄 License
 
-> **Примітки про кодування (важливо, інакше вікно блимає і гасне):**
-> - `scripts/setup_windows.ps1` має лишатись у кодуванні **UTF-8 with BOM + CRLF** (інакше PowerShell 5.1 ламається на кирилиці).
-> - `START.bat` має лишатись **чистим ASCII + CRLF, без кирилиці** (інакше cmd.exe розриває рядки і вікно закривається за секунду). Весь український текст — тільки в `tools/auto_run.py`.
-
-## Ручний режим (якщо треба покроково)
-
-### 1. Встановити драйвер (один раз)
-
-```powershell
-# Увімкнути Test Signing (потрібен для usbip-win2 без EV сертифіката)
-bcdedit /set testsigning on
-# Перезавантажити
-
-# Встановити usbip-win2: https://github.com/vadimgrn/usbip-win2/releases
-# Скачати usbip-win2.msi і встановити
-```
-
-### 2. Зібрати
-
-```powershell
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-
-# Тести
-ctest --test-dir build -V
-```
-
-### 3. Запустити (тест без телефону — симуляція)
-
-Відкрий 2 термінали:
-
-```powershell
-# Термінал 1 — Sender (симулює телефон + adbd)
-.\build\Release\agent_sender.exe --simulate-adb --adb 127.0.0.1:5555 --listen 0.0.0.0:22777
-
-# Термінал 2 — Receiver (створює віртуальний USB)
-.\build\Release\agent_receiver.exe --server 127.0.0.1:22777 --simulate
-# З --vhci: створить реальний пристрій в Device Manager
-.\build\Release\agent_receiver.exe --server 127.0.0.1:22777 --vhci
-
-# Перевірити
-adb devices
-# Має показати: 0123456789ABCDEF    device  (transport usb, а не tcp!)
-
-# Запустити scrcpy
-scrcpy --select-usb
-```
-
-### 4. Запустити з реальним телефоном
-
-```powershell
-# На телефоні: увімкнути Wireless Debugging (Android 11+)
-# Налаштування -> Для розробників -> Wireless debugging -> Pair
-
-# Або через USB один раз:
-adb tcpip 5555
-adb shell ip addr show wlan0  # дізнатися IP телефону, напр. 192.168.1.100
-
-# На Windows (Sender на телефоні — APK, або тимчасово через adb forward)
-# Для PoC: запустити sender на Windows який форвардить на телефон:
-.\build\Release\agent_sender.exe --adb 192.168.1.100:5555 --listen 0.0.0.0:22777
-
-# Receiver як і раніше
-.\build\Release\agent_receiver.exe --server 127.0.0.1:22777 --vhci
-```
-
-## Архітектура
-
-```
-[Android adbd:5555] <--TCP--> [Agent-Sender (NDK)] <--QUIC/WAN--> [Agent-Receiver] --> [vhci.sys] --> [WinUSB] --> [adb:5037] --> [scrcpy]
-                                  No-Root!                TLS 1.3              Ghost Mode!
-```
-
-**Ключові рішення:**
-
-- **VHCI:** `usbip-win2` (Virtual Host Controller) — єдиний спосіб дати `adb` справжній `USB` транспорт на Windows. `UsbDk` — deprecated.
-- **Транспорт:** `QUIC` (msquic) з 3 streams (Control, Bulk, Video) + fallback на `TCP+TLS`. `UDP+FEC` тільки для відео.
-- **GHOST mode:** При обриві мережі пристрій НЕ видаляється 30с, URB ставляться в чергу, replay при реконекті — `scrcpy` не крашиться.
-- **Jitter buffer:** 30мс для згладжування джиттеру WAN.
-- **FEC:** Reed-Solomon(14,10) для відео — відновлення до 4 втрат без ретрансміту.
-
-## Структура
-
-```
-src/common/protocol.h      — USBIP+WAN+ADB заголовки
-src/common/fec.h/.cpp      — FEC для відео
-src/common/ring_buffer.h   — Lock-free ring + UrbPool
-src/common/auto_setup.h    — Автоввід команд (adb/vhci/scrcpy), header-only
-src/agent_receiver/        — Windows VHCI інжектор, ADB spoof, Ghost (+ --auto)
-src/agent_sender/          — ADB bridge, Gadget stub (Tier-A) (+ --auto)
-tools/auto_run.py          — Автопілот: одна команда на все
-scripts/setup_windows.ps1  — Автоналаштування Windows (UTF-8 with BOM!)
-START.bat                  — Подвійний клік = автопілот
-tests/                     — test_fec, test_protocol, test_ringbuf
-```
-
-## Обмеження (чесно)
-
-- Без root/Pi — тільки ADB (достатньо для scrcpy), без MTP/PTP. З root/Pi — повний USB passthrough (див. `gadget_stub.cpp`).
-- Драйвер потребує `Test Signing` або EV сертифікат.
-- WAN латентність >100мс дає лаг (фізика). Для геймінгу — тільки LAN.
-- Див. повний список в [ARCHITECTURE.md §8](ARCHITECTURE.md#8-обмеження-та-чесні-застереження)
-
-## Ліцензія
-
-MIT
-"# scrcpy-wifi-moduel" 
+Distributed under the MIT License. See `LICENSE` for details.
