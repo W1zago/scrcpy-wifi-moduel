@@ -210,7 +210,8 @@
 
     api.onConnectResult((result) => {
       if (result.success) {
-        showToast(`✓ Підключено до ${result.name || result.ip + ':' + result.port}`);
+        const extra = result.scrcpy ? ' — відкриваю scrcpy...' : '';
+        showToast(`✓ Підключено до ${result.name || result.ip + ':' + result.port}${extra}`);
       } else {
         showToast(`✗ Помилка підключення: ${result.error || 'не вдалося'}`, true);
       }

@@ -28,10 +28,12 @@ auto_run.py — ОДНА команда замість всіх ручних к�
         парування — в тому ж вікні. БЕЗ КАБЕЛЮ через Бездротове налагодження
         (Android 11+): знаходить телефон сам по mDNS, просить тільки код з екрану
         (adb pair), потім adb connect на динамічний порт. Кабель взагалі не потрібен!
-      - якщо нічого не знайдено -> СКАНУЄ всю локальну мережу (порт 5555), показує
+      - якщо нічого не знайдено -> СКАНУЄ всю локальну мережу (5555 + порт
+        останнього пристрою + динамічні порти з mDNS + --scan-ports), показує
         список "IP — назва пристрою" (ro.product.model) і пропонує вибрати номер
       - якщо в мережі порожньо -> демо-режим (fake adbd)
-      Прапорці: --scan (примусовий скан), --no-scan (без скану 5555),
+      Прапорці: --scan (примусовий скан), --no-scan (без LAN-скану),
+                --scan-ports <список> (додаткові порти для скану),
                 --no-wireless (без безкабельного етапу), --pair-code <код>,
                 --pick <N|IP> (автовибір без запиту, без вікна), --scan-timeout <сек>,
                 --mdns-timeout <сек>, --gui (примусово вікно), --no-gui (тільки консоль)
@@ -77,6 +79,255 @@ SENDER_NAMES = ["agent_sender.exe", "agent_sender"]
 RECEIVER_NAMES = ["agent_receiver.exe", "agent_receiver"]
 DEFAULT_SENDER_PORT = 22777
 DEFAULT_ADB_PORT = 5555
+
+# ---------------- мультипорт-скан + автозапуск scrcpy ----------------
+# Проблема 1: LAN-скан дивився ТІЛЬКИ порт 5555, а Бездротове налагодження
+# (Android 11+) видає ДИНАМІЧНИЙ порт (напр. 37123). Якщо mDNS заблоковано
+# роутером/брандмауером — телефон взагалі не знаходився.
+# Проблема 2: після ручного adb connect картинка не з'являлась, бо scrcpy
+# запускався з --select-usb (тільки USB), а Wi-Fi пристрій — це TCP-серійник
+# IP:port і потребує scrcpy -s IP:port.
+
+def parse_scan_ports(s, default_port=5555):
+    """'5555,37123' -> [5555, 37123]. Сміття ігнорується."""
+    ports = []
+    for part in str(s or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            p = int(part)
+            if 1 <= p <= 65535 and p not in ports:
+                ports.append(p)
+    try:
+        default_port = int(default_port)
+    except Exception:
+        default_port = DEFAULT_ADB_PORT
+    if default_port not in ports:
+        ports.insert(0, default_port)
+    return ports
+
+
+def get_scan_ports(adb_port=5555, extra_ports=None, include_last=True, mdns_ports=None):
+    """Зібрати впорядкований список портів для LAN-скану.
+
+    Порядок (від найімовірнішого):
+      [adb_port (--adb-port/5555), порт останнього відомого пристрою,
+       --scan-ports, динамічні порти з mDNS].
+    """
+    try:
+        adb_port = int(adb_port)
+    except Exception:
+        adb_port = DEFAULT_ADB_PORT
+    ports = [adb_port]
+    if include_last:
+        try:
+            _lip, _lport = _split_serial(load_last_phone(), adb_port)
+            _lport = int(_lport)
+            if 1 <= _lport <= 65535 and _lport not in ports:
+                ports.append(_lport)
+        except Exception:
+            pass
+    for p in (extra_ports or []):
+        try:
+            p = int(p)
+            if 1 <= p <= 65535 and p not in ports:
+                ports.append(p)
+        except Exception:
+            pass
+    for p in (mdns_ports or []):
+        try:
+            p = int(p)
+            if 1 <= p <= 65535 and p not in ports:
+                ports.append(p)
+        except Exception:
+            pass
+    return ports
+
+
+def launch_scrcpy_for_device(ip, port, extra_args=None):
+    """Запустити scrcpy -s IP:port у фоні (картинка одразу після adb connect).
+
+    extra_args: додаткові прапорці якості (напр. ['-m','1280','-b','6M']).
+    Повертає True якщо процес стартував, False якщо scrcpy нема/не запустився.
+    ВАЖЛИВО: саме '-s серійник', а НЕ '--select-usb' (той бачить тільки USB).
+    """
+    if not shutil.which("scrcpy"):
+        log("scrcpy не знайдено в PATH — вікно з картинкою не відкриваю "
+            "(adb connect вже виконано).")
+        return False
+    serial = f"{ip}:{port}"
+    cmd = ["scrcpy", "-s", serial] + list(extra_args or [])
+    try:
+        log_cmd(cmd)
+        subprocess.Popen(cmd)
+        log(f"scrcpy запущено для {serial} — вікно з картинкою має відкритись.")
+        return True
+    except FileNotFoundError:
+        log("Не вдалося запустити scrcpy (not found).")
+        return False
+    except Exception as e:
+        log(f"Не вдалося запустити scrcpy: {e}")
+        return False
+
+
+def build_scrcpy_cmd(args, quality_extra, adb_host, adb_port_eff, use_fake_adb):
+    """Побудувати команду scrcpy з урахуванням TCP-пристрою.
+
+    - Демо/127.0.0.1 без телефону: як було (args.scrcpy_args).
+    - Реальний Wi-Fi пристрій: ['scrcpy','-s','IP:port', ...] без --select-usb
+      (--select-usb ігнорує TCP-пристрої — через це і не було картинки).
+    - Свої --scrcpy-args з -s/--select-*: поважаємо як є.
+    """
+    base = (getattr(args, "scrcpy_args", "") or "").split()
+    extra = list(quality_extra or [])
+    if use_fake_adb:
+        return ["scrcpy"] + base + extra
+    is_default = (getattr(args, "scrcpy_args", "") or "").strip() == "--select-usb"
+    if not is_default:
+        # Свої --scrcpy-args — поважаємо як є (там вже є -s / --select-*).
+        return ["scrcpy"] + base + extra
+    host = (adb_host or "").strip()
+    # TCP-пристрій: завжди -s (працює і для 5555, і для динамічного порту)
+    filtered = [t for t in base if t != "--select-usb"]
+    return ["scrcpy", "-s", f"{host}:{adb_port_eff}"] + filtered + extra
+
+
+def resolve_connect_port(ip, adb_port=5555, mdns_timeout=1.5, extra_ports=None,
+                         try_tcp=True):
+    """Знайти робочий ADB-порт для ВІДОМОГО IP (ручне введення без порту).
+
+    Порядок: mDNS connect-порт цього IP -> порт останнього пристрою ->
+    adb_port/5555 -> --scan-ports -> mDNS-порти інших пристроїв.
+    Повертає порт (int) або 0 якщо нічого не відкрито.
+    """
+    ip = (ip or "").strip()
+    if not ip:
+        return 0
+    try:
+        adb_port = int(adb_port)
+    except Exception:
+        adb_port = DEFAULT_ADB_PORT
+    mdns_ports_here = []
+    mdns_ports_all = []
+    try:
+        devs = mdns_discover_adb(timeout=max(0.8, min(float(mdns_timeout), 3.0)))
+        for d in devs:
+            if d.get("kind") == "connect" and d.get("ips") and d.get("port"):
+                try:
+                    mdns_ports_all.append(int(d["port"]))
+                except Exception:
+                    pass
+                if d["ips"][0] == ip:
+                    mdns_ports_here.append(int(d["port"]))
+    except Exception:
+        pass
+    cands = []
+    for p in mdns_ports_here:
+        if p not in cands:
+            cands.append(p)
+    try:
+        _lip, _lport = _split_serial(load_last_phone(), adb_port)
+        _lport = int(_lport)
+        if _lip == ip and _lport not in cands:
+            cands.append(_lport)
+    except Exception:
+        pass
+    if adb_port not in cands:
+        cands.append(adb_port)
+    if DEFAULT_ADB_PORT not in cands:
+        cands.append(DEFAULT_ADB_PORT)
+    for p in (extra_ports or []):
+        try:
+            p = int(p)
+            if p not in cands:
+                cands.append(p)
+        except Exception:
+            pass
+    for p in mdns_ports_all:
+        if p not in cands:
+            cands.append(p)
+    if not try_tcp:
+        return cands[0] if cands else 0
+    for p in cands:
+        try:
+            if _tcp_port_open(ip, p, 0.5):
+                if p != adb_port:
+                    log(f"Для {ip} знайдено відкритий порт {p} (замість {adb_port}).")
+                return p
+        except Exception:
+            pass
+    return 0
+
+
+def sweep_connect_port(ip, exclude=(), timeout=0.2, workers=512,
+                       port_min=30000, port_max=49999):
+    """Перебір динамічних портів ОДНОГО IP — останній шанс після парування.
+
+    Коли mDNS connect-сервіс не видно (ріже роутер), а IP телефону ТОЧНО
+    відомий (парування щойно пройшло), порт підключення шукаємо перебором
+    типового діапазону Бездротового налагодження. Повертає порт з ВІДКРИТИМ
+    TCP або 0. Займає ~10-15с, тому викликається тільки тут, а не при кожному скані.
+    """
+    ip = (ip or "").strip()
+    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return 0
+    try:
+        excl = {int(p) for p in (exclude or [])}
+    except Exception:
+        excl = set()
+    ports = [p for p in range(port_min, port_max + 1) if p not in excl]
+    log(f"Перебираю порти {ip}:{port_min}-{port_max} (до ~15с, шукаю динамічний порт)...")
+    found = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut2port = {ex.submit(_tcp_port_open, ip, p, timeout): p for p in ports}
+            for fut in concurrent.futures.as_completed(fut2port):
+                try:
+                    if fut.result():
+                        p = fut2port[fut]
+                        found.append(p)
+                        log(f"  ... {ip}:{p} відкрито, перевіряю чи це ADB...")
+                        # Перевіряємо одразу, не чекаючи кінця перебору
+                        if adb_connect_fast(ip, p, timeout=4.0):
+                            log(f"Це він: {ip}:{p} відповідає як ADB.")
+                            try:
+                                ex.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                pass
+                            found.sort()
+                            return p
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        pass
+    if found:
+        log(f"Відкриті порти {ip}: {found}, але adb connect не пішов.")
+    else:
+        log(f"У діапазоні {port_min}-{port_max} на {ip} нічого відкритого.")
+    return 0
+
+
+def _find_connect_port_after_pair(ip, pair_port=0, extra_ports=None):
+    """Знайти connect-порт після успішного парування.
+
+    Порядок: mDNS -> TCP-прощуп відомих кандидатів -> перебір 30000-49999.
+    Повертає порт або 0. Pair-порт свідомо виключаємо (це інший сервіс).
+    """
+    try:
+        pair_port = int(pair_port or 0)
+    except Exception:
+        pair_port = 0
+    try:
+        found = resolve_connect_port(ip, mdns_timeout=2.0, extra_ports=extra_ports)
+    except Exception:
+        found = 0
+    if found and found != pair_port:
+        return found
+    try:
+        return sweep_connect_port(ip, exclude=(pair_port,) if pair_port else ())
+    except Exception:
+        return 0
 
 # ---------------- логування ----------------
 
@@ -465,12 +716,20 @@ def _tcp_port_open(ip, port, timeout):
         return False
 
 
-def scan_lan_for_adb(adb_port=5555, timeout=0.45, workers=96, first_ip=None, on_found=None):
-    """Просканувати всі локальні підмережі, повернути сортированный список IP з відкритим adb-портом.
+def scan_lan_for_adb_ports(ports, timeout=0.45, workers=96, first_ip=None, on_found=None):
+    """Просканувати LAN по КІЛЬКОХ портах (5555 + динамічні порти Wi-Fi налагодження).
 
-    first_ip: підмережа з цим IP сканується першою. on_found(ip): колбек одразу як
-    знайдено відкритий порт (не чекаючи кінця скану — для живого оновлення списку).
+    ports: список портів. on_found(ip, port): колбек одразу як знайдено
+    (для сумісності колбек on_found(ip) з одним аргументом теж підтримується).
+    Повертає відсортований список (ip, port).
     """
+    try:
+        ports = [int(p) for p in (ports or []) if 1 <= int(p) <= 65535]
+    except Exception:
+        ports = []
+    ports = list(dict.fromkeys(ports))
+    if not ports:
+        return []
     nets = get_local_subnets(first_ip=first_ip)
     if not nets:
         log("LAN-сканування: не вдалося визначити локальну підмережу.")
@@ -488,35 +747,116 @@ def scan_lan_for_adb(adb_port=5555, timeout=0.45, workers=96, first_ip=None, on_
     if not targets:
         return []
     log(f"Сканую мережу: {', '.join(str(n) for n in nets)} "
-        f"({len(targets)} адрес, порт {adb_port})... це займе кілька секунд.")
-    open_ips = []
+        f"({len(targets)} адрес, порти {', '.join(str(p) for p in ports)})... це займе кілька секунд.")
+    open_pairs = []
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        fut2ip = {ex.submit(_tcp_port_open, ip, adb_port, timeout): ip for ip in targets}
-        for fut in concurrent.futures.as_completed(fut2ip):
+    combos = [(ip, port) for ip in targets for port in ports]
+    # Більше комбінацій — більше воркерів, але не безмежно
+    eff_workers = min(max(workers, 96), 256) if len(ports) > 1 else workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=eff_workers) as ex:
+        fut2pair = {ex.submit(_tcp_port_open, ip, port, timeout): (ip, port)
+                    for ip, port in combos}
+        for fut in concurrent.futures.as_completed(fut2pair):
             try:
                 if fut.result():
-                    ip = fut2ip[fut]
-                    open_ips.append(ip)
+                    ip, port = fut2pair[fut]
+                    open_pairs.append((ip, port))
                     if on_found:
                         try:
-                            on_found(ip)
+                            try:
+                                on_found(ip, port)
+                            except TypeError:
+                                on_found(ip)
                         except Exception:
                             pass
             except Exception:
                 pass
-    # Сортуємо як IP, не як рядки (щоб .100 не було перед .20)
+    # Сортуємо як IP, потім порт
     try:
-        open_ips.sort(key=lambda s: tuple(int(p) for p in s.split(".")))
+        open_pairs.sort(key=lambda t: (tuple(int(p) for p in t[0].split(".")), t[1]))
     except Exception:
-        open_ips.sort()
+        open_pairs.sort()
     dt = time.time() - t0
-    if open_ips:
-        log(f"Відкритий порт {adb_port} знайдено на: {', '.join(open_ips)} (скан {dt:.1f}с).")
+    if open_pairs:
+        log(f"Відкриті ADB-порти: {', '.join(f'{ip}:{p}' for ip, p in open_pairs)} (скан {dt:.1f}с).")
     else:
-        log(f"Нічого з відкритим портом {adb_port} не знайдено (скан {dt:.1f}с).")
+        log(f"Нічого з відкритими портами {ports} не знайдено (скан {dt:.1f}с).")
         log("Підказка: увімкніть на телефоні Бездротове налагодження або виконайте 'adb tcpip 5555' по USB.")
-    return open_ips
+    return open_pairs
+
+
+def scan_lan_for_adb(adb_port=5555, timeout=0.45, workers=96, first_ip=None, on_found=None,
+                     extra_ports=None, mdns_ports=None):
+    """Просканувати всі локальні підмережі, повернути сортированный список IP з відкритим adb-портом.
+
+    first_ip: підмережа з цим IP сканується першою. on_found(ip): колбек одразу як
+    знайдено відкритий порт (не чекаючи кінця скану — для живого оновлення списку).
+    extra_ports/mdns_ports: додаткові порти (динамічні порти Бездротового
+    налагодження, --scan-ports). Якщо їх нема — поведінка як раніше (тільки adb_port).
+    УВАГА: при кількох портах повертає IP у яких відкритий ХОЧА Б ОДИН з портів.
+    Для точних пар (ip, port) використовуйте scan_lan_for_adb_ports().
+    """
+    ports = get_scan_ports(adb_port, extra_ports=extra_ports,
+                           include_last=True, mdns_ports=mdns_ports)
+    if len(ports) == 1:
+        nets = get_local_subnets(first_ip=first_ip)
+        if not nets:
+            log("LAN-сканування: не вдалося визначити локальну підмережу.")
+            return []
+        targets = []
+        for net in nets:
+            hosts = list(net.hosts())
+            # Захист від /22 і більше (хоч get_local_subnets вже ріже до /24, перестраховуємось)
+            if len(hosts) > 1024:
+                log(f"LAN-сканування: {net} завелика ({len(hosts)} адрес) — сканую перші 1024.")
+                hosts = hosts[:1024]
+            targets.extend(str(h) for h in hosts)
+        # Прибрати дублікати, зберегти порядок (пріоритетна підмережа — першою)
+        targets = list(dict.fromkeys(targets))
+        if not targets:
+            return []
+        log(f"Сканую мережу: {', '.join(str(n) for n in nets)} "
+            f"({len(targets)} адрес, порт {adb_port})... це займе кілька секунд.")
+        open_ips = []
+        t0 = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut2ip = {ex.submit(_tcp_port_open, ip, adb_port, timeout): ip for ip in targets}
+            for fut in concurrent.futures.as_completed(fut2ip):
+                try:
+                    if fut.result():
+                        ip = fut2ip[fut]
+                        open_ips.append(ip)
+                        if on_found:
+                            try:
+                                on_found(ip)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        # Сортуємо як IP, не як рядки (щоб .100 не було перед .20)
+        try:
+            open_ips.sort(key=lambda s: tuple(int(p) for p in s.split(".")))
+        except Exception:
+            open_ips.sort()
+        dt = time.time() - t0
+        if open_ips:
+            log(f"Відкритий порт {adb_port} знайдено на: {', '.join(open_ips)} (скан {dt:.1f}с).")
+        else:
+            log(f"Нічого з відкритим портом {adb_port} не знайдено (скан {dt:.1f}с).")
+            log("Підказка: увімкніть на телефоні Бездротове налагодження або виконайте 'adb tcpip 5555' по USB.")
+        return open_ips
+    # Кілька портів: один прохід, повертаємо унікальні IP (перший знайдений порт — пріоритет adb_port)
+    pairs = scan_lan_for_adb_ports(ports, timeout=timeout, workers=workers,
+                                   first_ip=first_ip, on_found=on_found)
+    best = {}
+    rank = {p: i for i, p in enumerate(ports)}
+    for ip, port in pairs:
+        if ip not in best or rank.get(port, 99) < rank.get(best[ip], 99):
+            best[ip] = port
+    try:
+        return sorted(best.keys(), key=lambda s: tuple(int(p) for p in s.split(".")))
+    except Exception:
+        return sorted(best.keys())
 
 
 def _adb_shell_on(serial, args, timeout=6):
@@ -593,28 +933,50 @@ def get_device_info(ip, adb_port=5555):
 
 
 def scan_lan_with_names(adb_port=5555, timeout=0.45, on_found=None, first_ip=None,
-                        on_port_open=None):
+                        on_port_open=None, adb_ports=None, extra_ports=None, mdns_ports=None):
     """Скан LAN + назва кожного пристрою. Повертає список dict (див. get_device_info).
 
     Назви читаються ПАРАЛЕЛЬНО (по ~2с на всі, а не по черзі). on_port_open(ip):
     порт відкрився (назви ще нема). on_found(info): готова назва (одразу, не чекаючи інших).
+    adb_ports: явний список портів для скану. Якщо не задано — збирається сам:
+    [adb_port, порт останнього пристрою, extra_ports (--scan-ports), mdns_ports].
+    Це знаходить і 5555 (adb tcpip), і ДИНАМІЧНІ порти Бездротового налагодження.
     """
-    def on_open(ip):
+    ports = list(adb_ports) if adb_ports else get_scan_ports(
+        adb_port, extra_ports=extra_ports, include_last=True, mdns_ports=mdns_ports)
+    try:
+        ports = [int(p) for p in ports if 1 <= int(p) <= 65535]
+    except Exception:
+        ports = [adb_port]
+    ports = list(dict.fromkeys(ports))
+    if not ports:
+        ports = [adb_port]
+
+    def on_open(ip, port=None):
         if on_port_open:
             try:
-                on_port_open(ip)
+                try:
+                    on_port_open(ip, port if port is not None else ports[0])
+                except TypeError:
+                    on_port_open(ip)
             except Exception:
                 pass
 
-    ips = scan_lan_for_adb(adb_port=adb_port, timeout=timeout,
-                           first_ip=first_ip, on_found=on_open)
-    if not ips:
+    if len(ports) == 1:
+        ips = scan_lan_for_adb(adb_port=ports[0], timeout=timeout,
+                               first_ip=first_ip, on_found=on_open)
+        pairs = [(ip, ports[0]) for ip in ips]
+    else:
+        pairs = scan_lan_for_adb_ports(ports, timeout=timeout,
+                                       first_ip=first_ip, on_found=on_open)
+    if not pairs:
         return []
     infos = []
     lock = threading.Lock()
 
-    def resolve(ip):
-        info = get_device_info(ip, adb_port)
+    def resolve(pair):
+        ip, port = pair
+        info = get_device_info(ip, port)
         with lock:
             infos.append(info)
         log(f"  - {info['serial']} — {info['name']}")
@@ -626,9 +988,9 @@ def scan_lan_with_names(adb_port=5555, timeout=0.45, on_found=None, first_ip=Non
         return info
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(resolve, ips))
+        list(ex.map(resolve, pairs))
     try:
-        infos.sort(key=lambda d: tuple(int(p) for p in d["ip"].split(".")))
+        infos.sort(key=lambda d: (tuple(int(p) for p in d["ip"].split(".")), d.get("serial", "")))
     except Exception:
         pass
     return infos
@@ -1149,10 +1511,19 @@ def _wireless_pair_then_connect(pair_dev, pair_code, mdns_timeout=2.5):
     if same:
         cport = same[0]["port"]
     else:
-        cport_s = _prompt("Не знайшов порт автоматично. Введіть порт підключення ('IP address & Port'): ")
-        if not cport_s or not cport_s.isdigit():
-            return "", 0, False
-        cport = int(cport_s)
+        # mDNS connect-сервіс не побачив (хоча парування пройшло) —
+        # не чекаємо вводу одразу, а спочатку прощупуємо порти цього IP напряму
+        # (останній порт, 5555, порти з mDNS), в крайньому разі — перебір
+        # 30000-49999. Часто знаходить без жодних питань.
+        log("mDNS connect-сервіс не знайшов — шукаю порт цього IP (прощуп, потім перебір)...")
+        found = _find_connect_port_after_pair(ip, pair_port)
+        if found:
+            cport = found
+        else:
+            cport_s = _prompt("Не знайшов порт автоматично. Введіть порт підключення ('IP address & Port'): ")
+            if not cport_s or not cport_s.isdigit():
+                return "", 0, False
+            cport = int(cport_s)
     if adb_connect_fast(ip, cport, timeout=6.0):
         name = get_device_display_name(f"{ip}:{cport}")
         log(f"Підключено по Wi-Fi БЕЗ кабелю: {ip}:{cport} — {name}.")
@@ -1190,7 +1561,8 @@ def _gui_disconnect_others(devices_snapshot, keep_ip):
                     pass
 
 
-def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None,
+                                scan_ports=None):
     """Спроба відкрити CyberDeck Electron UI. Повертає (ip, port, ok) або None якщо не вдалося."""
     import json
     import subprocess
@@ -1198,6 +1570,8 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     import threading
     import time
     from pathlib import Path
+
+    _extra_scan_ports = [int(p) for p in (scan_ports or []) if str(p).isdigit()]
 
     ui_dir = ROOT / "ui"
     if not (ui_dir / "package.json").exists():
@@ -1307,12 +1681,26 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
         except Exception as e:
             send_event('status-update', f'mDNS: {e}')
 
-        # 2) LAN-сканування
-        def lan_open(ip):
+        # 2) LAN-сканування: 5555 + порт останнього пристрою + --scan-ports +
+        #    динамічні порти з mDNS (Бездротове налагодження дає випадковий порт,
+        #    і скан тільки 5555 такі телефони не бачив).
+        mdns_ports = []
+        try:
+            for _d in (mdevs or []):
+                if _d.get("kind") == "connect" and _d.get("port"):
+                    _p = int(_d["port"])
+                    if _p not in mdns_ports:
+                        mdns_ports.append(_p)
+        except Exception:
+            pass
+        lan_ports = get_scan_ports(adb_port, extra_ports=_extra_scan_ports,
+                                   include_last=True, mdns_ports=mdns_ports)
+
+        def lan_open(ip, port=None):
             report_device({
                 "kind": "lan",
                 "ip": ip,
-                "port": adb_port,
+                "port": port if port else lan_ports[0],
                 "name": "опитування...",
                 "state": "device"
             })
@@ -1321,7 +1709,7 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             report_device({
                 "kind": "lan",
                 "ip": info["ip"],
-                "port": adb_port,
+                "port": info.get("port", lan_ports[0]),
                 "name": info.get("name", "Android Device"),
                 "state": info.get("state", "device")
             })
@@ -1331,7 +1719,8 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                 adb_port=adb_port,
                 timeout=scan_timeout,
                 on_port_open=lan_open,
-                on_found=lan_named
+                on_found=lan_named,
+                adb_ports=lan_ports
             )
         except Exception as e:
             send_event('status-update', f'LAN скан: {e}')
@@ -1377,6 +1766,17 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                     code = str(cmd['code']).strip()
                     send_event('status-update', f'Парування з {ip}:{port}...')
                     def do_pair(tip=ip, tport=port, tcode=code):
+                        def _finish_connect(cp):
+                            conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
+                            name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
+                            if conn_ok:
+                                save_last_phone(f"{tip}:{cp}")
+                                send_event('connect-result', {'success': True, 'ip': tip, 'port': cp, 'name': name})
+                                send_event('status-update', f'Підключено: {tip}:{cp} — {name}')
+                                time.sleep(0.6)
+                                send_event('close-window', {})
+                                result.update(ip=tip, port=cp, ok=True, done=True)
+                            return conn_ok
                         ok = adb_pair_verify(tip, tport, tcode)
                         if ok:
                             send_event('pair-result', {'success': True, 'ip': tip, 'port': tport})
@@ -1384,20 +1784,22 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                             try:
                                 devs = mdns_discover_adb(timeout=2.0)
                                 same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == tip]
-                                if same:
-                                    cp = same[0]["port"]
-                                    conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
-                                    name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
-                                    if conn_ok:
-                                        save_last_phone(f"{tip}:{cp}")
-                                        send_event('connect-result', {'success': True, 'ip': tip, 'port': cp, 'name': name})
-                                        send_event('status-update', f'Підключено: {tip}:{cp} — {name}')
-                                        time.sleep(0.6)
-                                        send_event('close-window', {})
-                                        result.update(ip=tip, port=cp, ok=True, done=True)
-                                        return
+                                if same and _finish_connect(same[0]["port"]):
+                                    return
                             except Exception:
                                 pass
+                            # mDNS не дав порту — прощуп + перебір портів цього IP
+                            send_event('status-update', 'mDNS порту не дав — шукаю порт (прощуп, потім перебір)...')
+                            try:
+                                found = _find_connect_port_after_pair(
+                                    tip, tport, extra_ports=_extra_scan_ports)
+                            except Exception:
+                                found = 0
+                            if found and _finish_connect(found):
+                                return
+                            send_event('status-update',
+                                       'Порт підключення не знайшов. Введіть його вручну: '
+                                       'на телефоні «IP address & Port» → форма «Вручну» → Підключити.')
                         else:
                             send_event('pair-result', {'success': False, 'ip': tip, 'port': tport, 'error': 'Парування не вдалося'})
                             send_event('status-update', 'Парування не вдалося. Перевірте код.')
@@ -1431,15 +1833,19 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     return "", 0, False
 
 
-def gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+def gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None,
+                       scan_ports=None):
     """Вікно зі списком телефонів (mDNS + LAN), парування і підключення."""
-    res = electron_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+    res = electron_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
+                                        scan_ports=scan_ports)
     if res is not None:
         return res
-    return _tkinter_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+    return _tkinter_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
+                                         scan_ports=scan_ports)
 
 
-def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None):
+def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None,
+                                 scan_ports=None):
     """Вікно зі списком телефонів (mDNS + LAN), парування і підключення.
 
     Повертає (ip, port, ok) або None якщо вікно відкрити неможливо (нема дисплея).
@@ -1449,6 +1855,8 @@ def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     import threading
     import tkinter as tk
     from tkinter import ttk
+
+    _extra_scan_ports = [int(p) for p in (scan_ports or []) if str(p).isdigit()]
 
     result = {"ip": "", "port": 0, "ok": False}
     state = {"closed": False, "cancelled": False}
@@ -1620,27 +2028,41 @@ def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             add_device(item)
         if state["closed"]:
             return
-        # 2) LAN-скан: пріоритет — підмережа останнього IP; рядки з'являються наживо
-        set_status("Сканую LAN (порт 5555)...")
+        # 2) LAN-скан: пріоритет — підмережа останнього IP; рядки з'являються наживо.
+        # Скануємо 5555 + порт останнього пристрою + --scan-ports + mDNS-порти
+        # (динамічні порти Бездротового налагодження інакше не знайти).
+        mdns_ports = []
+        try:
+            for _d in (mdevs or []):
+                if _d.get("kind") == "connect" and _d.get("port"):
+                    _p = int(_d["port"])
+                    if _p not in mdns_ports:
+                        mdns_ports.append(_p)
+        except Exception:
+            pass
+        lan_ports = get_scan_ports(adb_port, extra_ports=_extra_scan_ports,
+                                   include_last=True, mdns_ports=mdns_ports)
+        set_status(f"Сканую LAN (порти {', '.join(str(p) for p in lan_ports)})...")
         last_ip = _split_serial(load_last_phone(), adb_port)[0] or None
 
-        def lan_open(ip):
+        def lan_open(ip, port=None):
             if state["closed"]:
                 return
-            add_device({"kind": "lan", "ip": ip, "port": adb_port,
-                        "name": "опитування...", "raw": {"serial": f"{ip}:{adb_port}"}})
+            _p = port if port else lan_ports[0]
+            add_device({"kind": "lan", "ip": ip, "port": _p,
+                        "name": "опитування...", "raw": {"serial": f"{ip}:{_p}"}})
 
         def lan_named(info):
             if state["closed"]:
                 return
-            add_device({"kind": "lan", "ip": info["ip"], "port": adb_port,
+            add_device({"kind": "lan", "ip": info["ip"], "port": info.get("port", lan_ports[0]),
                         "name": info["name"], "raw": info})
 
         try:
             # Імена/рядки приходять через колбеки наживо; повернений список тут не потрібен
             scan_lan_with_names(adb_port=adb_port, timeout=scan_timeout,
                                 first_ip=last_ip, on_port_open=lan_open,
-                                on_found=lan_named)
+                                on_found=lan_named, adb_ports=lan_ports)
         except Exception:
             pass
         q.put(("scan_done",))
@@ -1674,12 +2096,22 @@ def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             devs = []
         same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == ip]
         if not same:
-            q.put(("status", "Порт не знайшовся — введіть його вручну (IP address & Port)."))
-            man_vars["ip"].set(ip)
-            q.put(("show_manual",))
-            set_busy(False)
-            return
-        cp = same[0]["port"]
+            # mDNS не дав порту — прощуп + перебір портів цього IP
+            set_status("mDNS порту не дав — шукаю порт (прощуп, потім перебір)...")
+            try:
+                found = _find_connect_port_after_pair(ip, pp,
+                                                      extra_ports=_extra_scan_ports)
+            except Exception:
+                found = 0
+            if not found:
+                q.put(("status", "Порт не знайшовся — введіть його вручну (IP address & Port)."))
+                man_vars["ip"].set(ip)
+                q.put(("show_manual",))
+                set_busy(False)
+                return
+            cp = found
+        else:
+            cp = same[0]["port"]
         if adb_connect_fast(ip, cp, timeout=6.0):
             name = get_device_display_name(f"{ip}:{cp}")
             save_last_phone(f"{ip}:{cp}")
@@ -1857,26 +2289,51 @@ def _last_known_ip(default_port):
     return "", default_port
 
 
-def _try_lan_scan_pick(adb_port, scan_timeout, pick):
-    """Допоміжне: просканувати LAN, показати назви, дати вибрати, підключитись. Повертає (ip, ok)."""
+def _try_lan_scan_pick(adb_port, scan_timeout, pick, scan_ports=None, mdns_timeout=2.5):
+    """Допоміжне: просканувати LAN, показати назви, дати вибрати, підключитись.
+
+    Повертає (ip, port, ok). Порт — реальний (може бути динамічний, не 5555).
+    """
     try:
         first_ip = _last_known_ip(adb_port)[0] or None
-        infos = scan_lan_with_names(adb_port=adb_port, timeout=scan_timeout, first_ip=first_ip)
+        # mDNS-порти сюди: навіть якщо сам mDNS-хост не дістав IP, його порт
+        # підкаже які динамічні порти сканувати по всій LAN.
+        mdns_ports = []
+        try:
+            for _d in mdns_discover_adb(timeout=min(float(mdns_timeout), 2.5)):
+                if _d.get("kind") == "connect" and _d.get("port"):
+                    _p = int(_d["port"])
+                    if _p not in mdns_ports:
+                        mdns_ports.append(_p)
+        except Exception:
+            pass
+        infos = scan_lan_with_names(adb_port=adb_port, timeout=scan_timeout, first_ip=first_ip,
+                                    extra_ports=scan_ports, mdns_ports=mdns_ports)
     except Exception as e:
         log(f"LAN-сканування не вдалося: {e}")
-        return "", False
+        return "", adb_port, False
     if not infos:
-        return "", False
+        return "", adb_port, False
     chosen_ip = interactive_pick_device(infos, adb_port, pick=pick)
     if not chosen_ip:
-        return "", False
+        return "", adb_port, False
+    # Порт беремо з знайденого серійника (може бути динамічний, не 5555!)
+    chosen_port = adb_port
+    for _d in infos:
+        if _d.get("ip") == chosen_ip:
+            try:
+                _h, _p = _split_serial(_d.get("serial", ""), adb_port)
+                chosen_port = int(_p)
+            except Exception:
+                pass
+            break
     # Порт уже відкритий і назву прочитано — вистачить швидкого конекту
-    ok = adb_connect_fast(chosen_ip, adb_port, timeout=5.0)
+    ok = adb_connect_fast(chosen_ip, chosen_port, timeout=5.0)
     if ok:
-        save_last_phone(f"{chosen_ip}:{adb_port}")
-        return chosen_ip, True
-    diagnose_connect_fail(chosen_ip, adb_port)
-    return "", False
+        save_last_phone(f"{chosen_ip}:{chosen_port}")
+        return chosen_ip, chosen_port, True
+    diagnose_connect_fail(chosen_ip, chosen_port)
+    return "", adb_port, False
 
 
 def _split_serial(serial, default_port):
@@ -1891,11 +2348,12 @@ def _split_serial(serial, default_port):
 def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                      allow_scan=True, force_scan=False, scan_timeout=0.45, pick=None,
                      allow_wireless=True, mdns_timeout=2.5, pair_code=None,
-                     use_gui=True):
+                     use_gui=True, scan_ports=None):
     """Повний ланцюжок: USB->tcpip->connect, БЕЗ кабелю (Бездротове налагодження), скан LAN.
 
     Повертає (adb_host, adb_port_eff, demo_needed). Порт окремо бо в Бездротового
     налагодження він динамічний (не 5555).
+    scan_ports: додаткові порти для LAN-скану (--scan-ports).
     """
     if dry_run:
         log("(dry-run) пропустив би tcpip/pair/connect/сканування LAN")
@@ -1922,9 +2380,10 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             if ok:
                 return ip, port, False
         if allow_scan:
-            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            ip, port, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick,
+                                              scan_ports=scan_ports, mdns_timeout=mdns_timeout)
             if ok:
-                return ip, adb_port, False
+                return ip, port, False
         log(f"Залишаю вже підключений {already_tcp}.")
         host, port = _split_serial(already_tcp, adb_port)
         return host, port, False
@@ -1933,7 +2392,16 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
         ok = adb_connect_verify(phone_ip_override, adb_port)
         if ok:
             save_last_phone(f"{phone_ip_override}:{adb_port}")
-        return phone_ip_override, adb_port, not ok
+            return phone_ip_override, adb_port, False
+        # Порт міг бути динамічним (Бездротове налагодження): шукаємо реальний
+        found = resolve_connect_port(phone_ip_override, adb_port=adb_port,
+                                     mdns_timeout=mdns_timeout, extra_ports=scan_ports)
+        if found and found != adb_port:
+            log(f"Порт {adb_port} мовчить, пробую знайдений {found}...")
+            if adb_connect_verify(phone_ip_override, found):
+                save_last_phone(f"{phone_ip_override}:{found}")
+                return phone_ip_override, found, False
+        return phone_ip_override, adb_port, True
     has_usb = any(":" not in s and st == "device" for s, st, t in devs)
     if not has_usb:
         # Телефон міг залишитись в tcpip-режимі з минулого запуску (USB тоді мертвий).
@@ -1968,7 +2436,8 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
         if use_gui and _gui_usable() and not pick:
             log("Відкриваю вікно вибору пристрою...")
             try:
-                g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code)
+                g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
+                                         scan_ports=scan_ports)
             except Exception as e:
                 log(f"Вікно не відкрилось ({e}) — продовжую в консолі.")
                 g = None
@@ -1987,10 +2456,11 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                 return ip, port, False
         if allow_scan:
             log("")
-            log("Дивлюсь усі доступні IP-адреси в мережі (порт 5555)...")
-            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            log("Дивлюсь усі доступні IP-адреси в мережі (5555 + динамічні порти Wi-Fi)...")
+            ip, port, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick,
+                                              scan_ports=scan_ports, mdns_timeout=mdns_timeout)
             if ok:
-                return ip, adb_port, False
+                return ip, port, False
             log("У мережі нічого придатного не вибрано.")
         log("Реанімація не вдалася. Варіанти:")
         log("  - БЕЗ КАБЕЛЮ (Android 11+): увімкніть 'Бездротове налагодження' і запустіть знову — запропоную парування по коду")
@@ -2016,9 +2486,10 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             if ok:
                 return ip, port, False
         if allow_scan:
-            ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+            ip, port, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick,
+                                              scan_ports=scan_ports, mdns_timeout=mdns_timeout)
             if ok:
-                return ip, adb_port, False
+                return ip, port, False
         log("Не визначив IP. Передайте вручну: --phone-ip <IP телефону>")
         return "127.0.0.1", adb_port, True
     # КРОК 2: пробуємо КОЖНОГО кандидата з перевіркою
@@ -2037,9 +2508,10 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
     if allow_scan:
         log("")
         log("Дивлюсь усі доступні IP-адреси в мережі...")
-        ip, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick)
+        ip, port, ok = _try_lan_scan_pick(adb_port, scan_timeout, pick,
+                                          scan_ports=scan_ports, mdns_timeout=mdns_timeout)
         if ok:
-            return ip, adb_port, False
+            return ip, port, False
     return "127.0.0.1", adb_port, True
 
 # ---------------- якість каналу: хотспот, замір RTT/втрат, авто-профіль ----------------
@@ -2458,7 +2930,13 @@ def main():
     ap.add_argument("--mdns-timeout", type=float, default=2.5,
                     help="Скільки секунд слухати mDNS-анонси телефону (default 2.5)")
     ap.add_argument("--no-wireless", action="store_true",
-                    help="НЕ пробувати підключення без кабелю (тільки USB/tcpip/скан 5555)")
+                    help="НЕ пробувати підключення без кабелю (тільки USB/tcpip/скан LAN)")
+    ap.add_argument("--scan-ports", default="",
+                    help="Додаткові ADB-порти для LAN-скану через кому (напр. 37123,41234). "
+                         "За замовчуванням скан і так дивиться 5555 + порт останнього "
+                         "пристрою + динамічні порти з mDNS; це — для ручного доповнення.")
+    ap.add_argument("--no-auto-scrcpy", action="store_true",
+                    help="В electron-режимі НЕ запускати scrcpy -s після adb connect (тільки adb)")
     ap.add_argument("--gui", action="store_true",
                     help="Примусово показати вікно вибору пристрою (за замовчуванням вікно і так вискакує само)")
     ap.add_argument("--no-gui", action="store_true",
@@ -2469,7 +2947,11 @@ def main():
     args = ap.parse_args()
 
     if args.electron_mode:
-        electron_gui_mode(adb_port=args.adb_port, mdns_timeout=args.mdns_timeout, scan_timeout=args.scan_timeout)
+        _cli_scan_ports = [p for p in parse_scan_ports(args.scan_ports, args.adb_port)
+                           if p != args.adb_port] if args.scan_ports else []
+        electron_gui_mode(adb_port=args.adb_port, mdns_timeout=args.mdns_timeout,
+                          scan_timeout=args.scan_timeout, scan_ports=_cli_scan_ports,
+                          auto_scrcpy=(not args.no_auto_scrcpy))
         return 0
 
     print("=== Virtual USB Cable — АВТОПІЛОТ (сам вводить всі команди) ===", flush=True)
@@ -2522,8 +3004,10 @@ def main():
                 log("Варіанти: USB-кабель, --phone-ip, або БЕЗ кабелю через Бездротове налагодження (без --no-wireless).")
                 return 2
             # За замовчуванням: USB -> БЕЗ кабелю (mDNS + pair) -> скан LAN.
-            # --no-wireless вимикає безкабельний етап, --no-scan — скан 5555,
+            # --no-wireless вимикає безкабельний етап, --no-scan — скан LAN,
             # --scan примушує показати всі пристрої навіть при наявному підключенні.
+            _cli_scan_ports = [p for p in parse_scan_ports(args.scan_ports, args.adb_port)
+                               if p != args.adb_port] if args.scan_ports else []
             adb_host, adb_port_eff, need_demo = setup_phone_wifi(
                 args.adb_port, args.phone_ip, args.dry_run,
                 devs if not args.dry_run else None,
@@ -2531,7 +3015,8 @@ def main():
                 scan_timeout=args.scan_timeout, pick=args.pick or None,
                 allow_wireless=(not args.no_wireless),
                 mdns_timeout=args.mdns_timeout, pair_code=args.pair_code or None,
-                use_gui=args.gui or (not args.no_gui and not args.pick))
+                use_gui=args.gui or (not args.no_gui and not args.pick),
+                scan_ports=_cli_scan_ports)
             if args.mode == "real" and need_demo and not args.dry_run:
                 # в real пробуємо ще раз показати
                 devs2 = print_adb_devices()
@@ -2550,14 +3035,14 @@ def main():
         log_cmd(f"agent_receiver --server 127.0.0.1:{args.sender_port} --auto --simulate"
                 + (" --vhci" if args.with_vhci else ""))
         if not args.no_scrcpy:
-            log_cmd(f"scrcpy {args.scrcpy_args}")
+            _dry_quality, _ = decide_quality(args, adb_host, use_fake_adb)
+            log_cmd(" ".join(build_scrcpy_cmd(args, _dry_quality, adb_host, adb_port_eff, use_fake_adb)))
         log("DRY-RUN готово.")
         return 0
     # [3b] якість каналу (хотспот? замір? профіль scrcpy + jitter).
     # В демо decide_quality нічого не робить (нема телефону).
     log("Крок 3b: перевірка якості каналу (хотспот/замір)...")
     quality_extra, jitter_ms = decide_quality(args, adb_host, use_fake_adb)
-    scrcpy_base = args.scrcpy_args.split() + quality_extra
     if not sender_bin or not receiver_bin:
         # FALLBACK: бінарників нема (нема toolchain), АЛЕ телефон вже по Wi-Fi в device —
         # даємо робоче дзеркало ВЖЕ ЗАРАЗ через звичайний scrcpy по TCP.
@@ -2658,15 +3143,17 @@ def main():
     if has_adb and not args.dry_run:
         print_adb_devices()
 
-    # [7] scrcpy
+    # [7] scrcpy — для Wi-Fi пристрою ОБОВ'ЯЗКОВО '-s IP:port', а не --select-usb
+    # (--select-usb бачить тільки USB і давав чорний екран / "no device").
+    scrcpy_cmd = build_scrcpy_cmd(args, quality_extra, adb_host, adb_port_eff, use_fake_adb)
     scrcpy_proc = None
     if not args.no_scrcpy:
         if not has_scrcpy:
             log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: winget install Genymobile.scrcpy")
         else:
-            log(f"Крок 7: запускаю scrcpy САМ: scrcpy {' '.join(scrcpy_base)} ...")
+            log(f"Крок 7: запускаю scrcpy САМ: {' '.join(scrcpy_cmd)} ...")
             try:
-                scrcpy_proc = subprocess.Popen(["scrcpy"] + scrcpy_base)
+                scrcpy_proc = subprocess.Popen(scrcpy_cmd)
                 log(f"scrcpy запущено (pid={scrcpy_proc.pid}).")
             except FileNotFoundError:
                 log("Не вдалося запустити scrcpy.")
@@ -2705,11 +3192,14 @@ def main():
     return 0
 
 
-def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=0.45):
+def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=0.45,
+                     scan_ports=None, auto_scrcpy=True):
     """GUI режим для Electron: JSON events через stdout / команди через stdin."""
     import json
     import sys
     import threading
+
+    _extra_scan_ports = [int(p) for p in (scan_ports or []) if str(p).isdigit()]
 
     def emit(event_type, data):
         try:
@@ -2785,12 +3275,26 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
         except Exception as e:
             emit('status-update', f'mDNS: {e}')
 
-        # 2) LAN-сканування
-        def lan_open(ip):
+        # 2) LAN-сканування: 5555 + порт останнього пристрою + --scan-ports +
+        #    динамічні порти з mDNS (Бездротове налагодження дає випадковий порт,
+        #    і скан тільки 5555 такі телефони не бачив).
+        mdns_ports = []
+        try:
+            for _d in (mdevs or []):
+                if _d.get("kind") == "connect" and _d.get("port"):
+                    _p = int(_d["port"])
+                    if _p not in mdns_ports:
+                        mdns_ports.append(_p)
+        except Exception:
+            pass
+        lan_ports = get_scan_ports(adb_port, extra_ports=_extra_scan_ports,
+                                   include_last=True, mdns_ports=mdns_ports)
+
+        def lan_open(ip, port=None):
             report_device({
                 "kind": "lan",
                 "ip": ip,
-                "port": adb_port,
+                "port": port if port else lan_ports[0],
                 "name": "опитування...",
                 "state": "device"
             })
@@ -2799,7 +3303,7 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
             report_device({
                 "kind": "lan",
                 "ip": info["ip"],
-                "port": adb_port,
+                "port": info.get("port", lan_ports[0]),
                 "name": info.get("name", "Android Device"),
                 "state": info.get("state", "device")
             })
@@ -2809,7 +3313,8 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
                 adb_port=adb_port,
                 timeout=scan_timeout,
                 on_port_open=lan_open,
-                on_found=lan_named
+                on_found=lan_named,
+                adb_ports=lan_ports
             )
         except Exception as e:
             emit('status-update', f'LAN скан: {e}')
@@ -2838,17 +3343,37 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
                 emit('status-update', f'Підключення до {ip}:{port}...')
                 def do_connect(tip=ip, tport=port):
                     result = adb_connect_fast(tip, tport)
-                    name = get_device_display_name(f"{tip}:{tport}") if result else ""
+                    eff_port = tport
+                    if not result:
+                        # Порт міг змінитись (динамічний порт Бездротового налагодження):
+                        # шукаємо реальний порт цього IP і пробуємо ще раз.
+                        found = resolve_connect_port(
+                            tip, adb_port=adb_port, mdns_timeout=1.5,
+                            extra_ports=_extra_scan_ports)
+                        if found and found != tport:
+                            emit('status-update', f'Порт {tport} мовчить, пробую {tip}:{found}...')
+                            if adb_connect_fast(tip, found, timeout=5.0):
+                                result = True
+                                eff_port = found
+                    name = get_device_display_name(f"{tip}:{eff_port}") if result else ""
+                    scrcpy_ok = False
                     if result:
-                        save_last_phone(f"{tip}:{tport}")
+                        save_last_phone(f"{tip}:{eff_port}")
+                        if auto_scrcpy:
+                            emit('status-update', f'Підключено до {tip}:{eff_port} — запускаю scrcpy...')
+                            scrcpy_ok = launch_scrcpy_for_device(tip, eff_port)
                     emit('connect-result', {
                         'success': bool(result),
                         'ip': tip,
-                        'port': tport,
+                        'port': eff_port,
                         'name': name,
-                        'error': '' if result else 'Не вдалося підключитися'
+                        'scrcpy': scrcpy_ok,
+                        'error': '' if result else 'Не вдалося підключитися (перевірте IP/порт з екрану «IP address & Port»)'
                     })
-                    emit('status-update', f'Підключено до {tip}:{tport}' if result else f'Помилка підключення до {tip}:{tport}')
+                    if result:
+                        emit('status-update', f'Підключено до {tip}:{eff_port}' + ('' if scrcpy_ok else ' (scrcpy не стартував — запустіть вручну: scrcpy -s %s:%s)' % (tip, eff_port)))
+                    else:
+                        emit('status-update', f'Помилка підключення до {tip}:{tport}')
                 threading.Thread(target=do_connect, daemon=True).start()
             elif cmd_type == 'pair':
                 ip = cmd['ip']
@@ -2856,6 +3381,17 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
                 code = str(cmd['code']).strip()
                 emit('status-update', f'Парування з {ip}:{port}...')
                 def do_pair(tip=ip, tport=port, tcode=code):
+                    def _finish_connect(cp):
+                        conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
+                        name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
+                        scrcpy_ok = False
+                        if conn_ok:
+                            save_last_phone(f"{tip}:{cp}")
+                            if auto_scrcpy:
+                                scrcpy_ok = launch_scrcpy_for_device(tip, cp)
+                        emit('connect-result', {'success': bool(conn_ok), 'ip': tip, 'port': cp, 'name': name, 'scrcpy': scrcpy_ok})
+                        emit('status-update', f'Підключено БЕЗ кабелю: {tip}:{cp} — {name}' if conn_ok else 'Не вдалося підключитися до порту підключення.')
+                        return conn_ok
                     result = adb_pair_verify(tip, tport, tcode)
                     if result:
                         emit('pair-result', {'success': True, 'ip': tip, 'port': tport})
@@ -2863,17 +3399,22 @@ def electron_gui_mode(adb_port=DEFAULT_ADB_PORT, mdns_timeout=2.5, scan_timeout=
                         try:
                             devs = mdns_discover_adb(timeout=2.0)
                             same = [x for x in devs if x["kind"] == "connect" and x["ips"] and x["ips"][0] == tip]
-                            if same:
-                                cp = same[0]["port"]
-                                conn_ok = adb_connect_fast(tip, cp, timeout=6.0)
-                                name = get_device_display_name(f"{tip}:{cp}") if conn_ok else ""
-                                if conn_ok:
-                                    save_last_phone(f"{tip}:{cp}")
-                                emit('connect-result', {'success': bool(conn_ok), 'ip': tip, 'port': cp, 'name': name})
-                                emit('status-update', f'Підключено БЕЗ кабелю: {tip}:{cp} — {name}' if conn_ok else 'Не вдалося підключитися до порту підключення.')
+                            if same and _finish_connect(same[0]["port"]):
                                 return
                         except Exception:
                             pass
+                        # mDNS не дав порту — прощуп + перебір портів цього IP
+                        emit('status-update', 'mDNS порту не дав — шукаю порт (прощуп, потім перебір)...')
+                        try:
+                            found = _find_connect_port_after_pair(
+                                tip, tport, extra_ports=_extra_scan_ports)
+                        except Exception:
+                            found = 0
+                        if found and _finish_connect(found):
+                            return
+                        emit('status-update',
+                             'Порт підключення не знайшов. Введіть його вручну: '
+                             'на телефоні «IP address & Port» → форма «Вручну» → Підключити.')
                     else:
                         emit('pair-result', {'success': False, 'ip': tip, 'port': tport, 'error': 'Парування не вдалося'})
                         emit('status-update', 'Парування не вдалося. Перевірте код.')
