@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Події від Python до UI
   onDeviceFound: (callback) => ipcRenderer.on('device-found', (_, device) => callback(device)),
+  onDeviceList: (callback) => ipcRenderer.on('device-list', (_, list) => callback(list)),
   onScanProgress: (callback) => ipcRenderer.on('scan-progress', (_, data) => callback(data)),
   onStatus: (callback) => ipcRenderer.on('status-update', (_, text) => callback(text)),
   onConnectResult: (callback) => ipcRenderer.on('connect-result', (_, result) => callback(result)),

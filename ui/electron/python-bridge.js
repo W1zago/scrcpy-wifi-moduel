@@ -12,10 +12,20 @@ class PythonBridge extends EventEmitter {
 
   start() {
     const scriptPath = path.join(this.projectRoot, 'tools', 'auto_run.py');
+    const extraArgs = [];
+    // Прокидаємо режим скану дочірньому python:
+    // npm start -- --port-scan  /  electron . --port-scan
+    if (process.argv.includes('--port-scan')) {
+      extraArgs.push('--port-scan');
+    }
+    if (process.argv.includes('--ip-only')) {
+      extraArgs.push('--ip-only');
+    }
     this.process = spawn('python', [
       scriptPath,
       '--electron-mode',
-      '--no-gui'
+      '--no-gui',
+      ...extraArgs
     ], {
       cwd: this.projectRoot,
       windowsHide: true,

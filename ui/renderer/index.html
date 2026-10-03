@@ -110,6 +110,12 @@
         <span class="text-[10px] text-dim/80">ADB: авто (5555 + Wi-Fi)</span>
       </div>
 
+      <!-- Показати/сховати непідписані (живі IP без даних ADB) -->
+      <button id="toggle-unsigned-btn" class="hidden no-drag w-full px-2.5 py-1.5 rounded-md bg-card hover:bg-card-hover border border-dashed border-bordercol text-dim hover:text-white text-[11px] font-medium items-center justify-center gap-1.5 transition-colors active:scale-[0.99]">
+        <span class="material-symbols-outlined text-[14px]" id="toggle-unsigned-icon">visibility</span>
+        <span id="toggle-unsigned-text">Показати непідписані пристрої</span>
+      </button>
+
       <!-- Dynamic Device List Container -->
       <div id="device-list" class="flex flex-col gap-3">
         <!-- Devices rendered dynamically via renderer.js -->

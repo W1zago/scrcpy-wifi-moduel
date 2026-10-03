@@ -9,6 +9,8 @@
   let devices = [];
   const openPairDrawers = new Set();
   let toastTimeout = null;
+  // Непідписані (живі IP без даних ADB) сховані, поки юзер не попросить
+  let showUnsigned = false;
 
   // Helper: Toast повідомлення
   function showToast(text, isError = false) {
@@ -36,12 +38,37 @@
     const container = document.getElementById('device-list');
     const noDevicesMsg = document.getElementById('no-devices-msg');
     const countLabel = document.getElementById('device-count-label');
+    const toggleBtn = document.getElementById('toggle-unsigned-btn');
+    const toggleText = document.getElementById('toggle-unsigned-text');
+    const toggleIcon = document.getElementById('toggle-unsigned-icon');
+
+    const signed = devices.filter(d => d.kind !== 'net');
+    const unsigned = devices.filter(d => d.kind === 'net');
+    const visible = showUnsigned ? devices : signed;
 
     if (countLabel) {
-      countLabel.textContent = `Знайдені пристрої (${devices.length})`;
+      countLabel.textContent = `Знайдені пристрої (${signed.length})`;
     }
 
-    if (devices.length === 0) {
+    // Кнопка "Показати непідписані" — тільки коли такі є
+    if (toggleBtn) {
+      if (unsigned.length > 0) {
+        toggleBtn.classList.remove('hidden');
+        toggleBtn.classList.add('flex');
+        if (toggleText) {
+          toggleText.textContent = showUnsigned
+            ? `Сховати непідписані (${unsigned.length})`
+            : `Показати непідписані пристрої (${unsigned.length})`;
+        }
+        if (toggleIcon) toggleIcon.textContent = showUnsigned ? 'visibility_off' : 'visibility';
+      } else {
+        toggleBtn.classList.add('hidden');
+        toggleBtn.classList.remove('flex');
+        showUnsigned = false;
+      }
+    }
+
+    if (visible.length === 0) {
       if (noDevicesMsg) noDevicesMsg.classList.remove('hidden');
       if (container) container.innerHTML = '';
       return;
@@ -49,9 +76,35 @@
 
     if (noDevicesMsg) noDevicesMsg.classList.add('hidden');
 
-    container.innerHTML = devices.map((device, index) => {
+    container.innerHTML = visible.map((device, index) => {
       const isPairing = device.kind === 'pair';
       const drawerOpen = openPairDrawers.has(index);
+
+      if (device.kind === 'net') {
+        return `
+        <div class="device-card-lift bg-card rounded-lg border border-bordercol p-3.5 flex items-center justify-between gap-3">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-9 h-9 rounded-lg bg-white/5 border border-bordercol text-dim flex items-center justify-center shrink-0">
+              <span class="material-symbols-outlined text-[20px]">lan</span>
+            </div>
+            <div class="flex flex-col min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="text-sm font-semibold text-white truncate font-mono">${device.ip}</span>
+                <span class="px-1.5 py-0.2 rounded text-[10px] font-mono bg-white/5 text-dim border border-bordercol">IP</span>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-dim mt-0.5 font-sans">
+                <span>Порт невідомий — знайдемо самі (~15с)</span>
+              </div>
+            </div>
+          </div>
+          <button class="probe-btn no-drag h-8 px-3 rounded-md bg-white/5 hover:bg-white/10 border border-bordercol text-white text-xs font-semibold flex items-center gap-1.5 transition-all active:scale-95 shrink-0"
+                  data-ip="${device.ip}">
+            <span>Знайти порти</span>
+            <span class="material-symbols-outlined text-[15px]">radar</span>
+          </button>
+        </div>
+      `;
+      }
 
       if (isPairing) {
         return `
@@ -98,6 +151,7 @@
             </div>
           </div>
         `;
+
       }
 
       return `
@@ -139,6 +193,19 @@
         showToast(`Підключення до ${ip}:${port}...`);
         if (api) {
           api.connectDevice(ip, port);
+        }
+      });
+    });
+
+    // Обробники кнопок "Знайти порти" (живий хост без відомого порту:
+    // шлемо порт 0 — бекенд підбере сам прощупом і перебором)
+    container.querySelectorAll('.probe-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const button = e.currentTarget;
+        const ip = button.dataset.ip;
+        showToast(`Шукаю порти на ${ip}... (до ~20с)`);
+        if (api) {
+          api.connectDevice(ip, 0);
         }
       });
     });
@@ -194,6 +261,18 @@
       renderDeviceList();
     });
 
+    // Контрольний знімок списку в кінці скану: замінює все, щоб UI показував
+    // рівно те що знайшов бекенд (окремі device-found могли загубитись).
+    if (api.onDeviceList) {
+      api.onDeviceList((list) => {
+        console.log('[Renderer] Device list snapshot:', list);
+        if (Array.isArray(list)) {
+          devices = list;
+          renderDeviceList();
+        }
+      });
+    }
+
     api.onScanProgress((data) => {
       const bar = document.getElementById('scan-progress-bar');
       if (data && data.done && bar) {
@@ -232,6 +311,12 @@
       });
     }
   }
+
+  // Кнопка "Показати/Сховати непідписані"
+  document.getElementById('toggle-unsigned-btn')?.addEventListener('click', () => {
+    showUnsigned = !showUnsigned;
+    renderDeviceList();
+  });
 
   // Кнопка оновлення сканування
   document.getElementById('rescan-btn')?.addEventListener('click', () => {
