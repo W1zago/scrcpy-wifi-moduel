@@ -2030,14 +2030,34 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
         return None
 
     electron_exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    if not electron_exe.exists() and not (ui_dir / "node_modules").exists():
+        log("Electron UI: нема ui/node_modules — CyberDeck без нього не стартує.")
+        _npm_try = shutil.which("npm.cmd") or shutil.which("npm")
+        if _npm_try and _stdin_interactive() and ask_yes_no(
+                "Встановити залежності CyberDeck UI зараз (cd ui && npm install, 1-3 хв, одноразово)?",
+                default_yes=True):
+            log("Встановлюю залежності UI — не закривайте вікно...")
+            _inst = [_npm_try, "install", "--no-audit", "--no-fund"]
+            if os.name == "nt" and str(_npm_try).lower().endswith((".cmd", ".bat")):
+                _inst = ["cmd", "/c"] + _inst
+            try:
+                log_cmd(["npm", "install", "--no-audit", "--no-fund"])
+                _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
+                if _ir.returncode == 0 and electron_exe.exists():
+                    log("Залежності UI встановлено.")
+                else:
+                    log(f"npm install завершився з кодом {_ir.returncode}. "
+                        "Якщо Electron не стартує — спробуйте вручну: cd ui && npm install, "
+                        "і покажіть текст помилки.")
+            except Exception as e:
+                log(f"npm install не вдався ({e}) — продовжую без CyberDeck.")
+        else:
+            log("Одноразово виконайте вручну: cd ui && npm install "
+                "(потрібен Node.js LTS з https://nodejs.org). "
+                "Поки що пробую запустити через npm...")
     if electron_exe.exists():
         cmd = [str(electron_exe), str(ui_dir), "--parent-python"]
     else:
-        if not (ui_dir / "node_modules").exists():
-            log("Electron UI: нема ui/node_modules — CyberDeck без нього не стартує. "
-                "Одноразово виконайте: cd ui && npm install "
-                "(потрібен Node.js LTS з https://nodejs.org). "
-                "Поки що переходжу на стандартне вікно...")
         npm_bin = shutil.which("npm.cmd") or shutil.which("npm") or shutil.which("npx.cmd") or shutil.which("npx")
         if not npm_bin:
             log("Electron UI пропущено: не знайдено npm/npx в PATH "
@@ -3171,12 +3191,36 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             break
     if already_tcp and not force_scan:
         log(f"Вже є Wi-Fi пристрій {already_tcp} — tcpip пропускаю.")
+        log("Вікно вибору не відкриваю: пристрій вже підключено, воно не потрібне. "
+            "Щоб примусово побачити вікно: START.bat --scan (або adb disconnect).")
         save_last_phone(already_tcp)
         host, port = _split_serial(already_tcp, adb_port)
         return host, port, False
     if already_tcp and force_scan and (allow_scan or allow_wireless):
         # --scan: навіть якщо щось вже підключено, показуємо ВСІ доступні IP і даємо вибрати
         log(f"Примусове сканування (--scan): вже підключено {already_tcp}, але дивлюсь всі IP в мережі...")
+        if use_gui and _gui_usable() and not pick:
+            log("Відкриваю вікно вибору пристрою (--scan)...")
+            try:
+                _g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
+                                          scan_ports=scan_ports)
+            except Exception as e:
+                log(f"Вікно не відкрилось ({e}) — продовжую в консолі.")
+                _g = None
+            if _g is not None:
+                _ip, _port, _ok = _g
+                if _ok:
+                    return _ip, _port, False
+                log("У вікні нічого не вибрано — пробую консольний шлях.")
+        elif pick:
+            log(f"Вікно пропущено: задано --pick {pick} (автовибір без вікна).")
+        elif not use_gui:
+            log("Вікно пропущено: режим --no-gui (тільки консоль). "
+                "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
+        elif not _gui_usable():
+            log("Вікно пропущено: в цьому Python нема tkinter. "
+                "Перевстановіть Python з https://www.python.org/downloads/ "
+                "(лишіть опцію 'tcl/tk and IDLE'). Продовжую в консолі.")
         if allow_wireless:
             ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
                                                adb_port=adb_port,
