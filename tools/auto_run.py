@@ -3199,7 +3199,7 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
     if already_tcp and force_scan and (allow_scan or allow_wireless):
         # --scan: навіть якщо щось вже підключено, показуємо ВСІ доступні IP і даємо вибрати
         log(f"Примусове сканування (--scan): вже підключено {already_tcp}, але дивлюсь всі IP в мережі...")
-        if use_gui and _gui_usable() and not pick:
+        if use_gui and not pick:
             log("Відкриваю вікно вибору пристрою (--scan)...")
             try:
                 _g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
@@ -3217,10 +3217,6 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
         elif not use_gui:
             log("Вікно пропущено: режим --no-gui (тільки консоль). "
                 "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
-        elif not _gui_usable():
-            log("Вікно пропущено: в цьому Python нема tkinter. "
-                "Перевстановіть Python з https://www.python.org/downloads/ "
-                "(лишіть опцію 'tcl/tk and IDLE'). Продовжую в консолі.")
         if allow_wireless:
             ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
                                                adb_port=adb_port,
@@ -3281,7 +3277,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                 return lip, lport, False
         # Кабелю нема — вискакує ВІКНО зі знайденими телефонами (як Bluetooth):
         # скан у фоні, клік → підключення, код парування — в тому ж вікні.
-        if use_gui and _gui_usable() and not pick:
+        # Умова свідомо БЕЗ _gui_usable(): Electron-вкно tkinter не потребує,
+        # а відсутній tkinter з'ясується у fallback (там же і залогується).
+        if use_gui and not pick:
             log("Відкриваю вікно вибору пристрою...")
             try:
                 g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
@@ -3304,11 +3302,6 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             elif not use_gui:
                 log("Вікно пропущено: режим --no-gui (тільки консоль). "
                     "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
-            elif not _gui_usable():
-                log("Вікно пропущено: в цьому Python нема tkinter. "
-                    "Перевстановіть Python з https://www.python.org/downloads/ "
-                    "(під час встановлення лишіть опцію 'tcl/tk and IDLE'). "
-                    "Поки що продовжую в консолі.")
         # Без вікна (нема дисплея / --no-gui / --pick / вікно не допомогло):
         # консольний флоу.
         # СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
