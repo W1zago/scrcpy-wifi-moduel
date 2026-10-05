@@ -114,6 +114,14 @@ Run via Windows script:
 START.bat
 ```
 
+Window with the phone list opens first; closed it without a choice —
+the script continues automatically in the console.
+Console-only mode (never opens a window):
+
+```cmd
+START_CONSOLE.bat
+```
+
 #### Option B: Advanced Command Line Interface
 
 ```powershell

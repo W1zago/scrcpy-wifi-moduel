@@ -3171,15 +3171,35 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                      allow_scan=True, force_scan=False, scan_timeout=0.45, pick=None,
                      allow_wireless=True, mdns_timeout=2.5, pair_code=None,
                      use_gui=True, scan_ports=None):
-    """Повний ланцюжок: USB->tcpip->connect, БЕЗ кабелю (Бездротове налагодження), скан LAN.
+    """Повний ланцюжок: СПОЧАТКУ вікно вибору, потім USB->tcpip->connect,
+    БЕЗ кабелю (Бездротове налагодження), скан LAN.
 
     Повертає (adb_host, adb_port_eff, demo_needed). Порт окремо бо в Бездротового
     налагодження він динамічний (не 5555).
     scan_ports: додаткові порти для LAN-скану (--scan-ports).
+    Без вікна: --no-gui / --pick / явно заданий --phone-ip (див. START_CONSOLE.bat).
     """
     if dry_run:
         log("(dry-run) пропустив би tcpip/pair/connect/сканування LAN")
         return "127.0.0.1", adb_port, True
+    # ВІКНО — ЗАВЖДИ першим (крім --no-gui / --pick / явно заданого --phone-ip):
+    # список телефонів, клік → підключення, код парування — в тому ж вікні.
+    # Закрили без вибору або вікно неможливе — тихо йдемо звичайним шляхом нижче.
+    _window_tried = False
+    if use_gui and not pick and not phone_ip_override:
+        log("Відкриваю вікно вибору пристрою...")
+        try:
+            _w = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
+                                      scan_ports=scan_ports)
+        except Exception as e:
+            log(f"Вікно не відкрилось ({e}) — продовжую автоматично в консолі.")
+            _w = None
+        _window_tried = True
+        if _w is not None:
+            _wip, _wport, _wok = _w
+            if _wok:
+                return _wip, _wport, False
+            log("У вікні нічого не вибрано — продовжую автоматично.")
     # adb server вже запущено викликачем (main); список або передано, або читаємо свіжий
     if devs is None:
         devs = print_adb_devices()
@@ -3191,15 +3211,14 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             break
     if already_tcp and not force_scan:
         log(f"Вже є Wi-Fi пристрій {already_tcp} — tcpip пропускаю.")
-        log("Вікно вибору не відкриваю: пристрій вже підключено, воно не потрібне. "
-            "Щоб примусово побачити вікно: START.bat --scan (або adb disconnect).")
         save_last_phone(already_tcp)
         host, port = _split_serial(already_tcp, adb_port)
         return host, port, False
     if already_tcp and force_scan and (allow_scan or allow_wireless):
         # --scan: навіть якщо щось вже підключено, показуємо ВСІ доступні IP і даємо вибрати
         log(f"Примусове сканування (--scan): вже підключено {already_tcp}, але дивлюсь всі IP в мережі...")
-        if use_gui and not pick:
+        # Вікно вже показували на вході (_window_tried) — повторно не відкриваємо.
+        if use_gui and not pick and not _window_tried:
             log("Відкриваю вікно вибору пристрою (--scan)...")
             try:
                 _g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
@@ -3212,11 +3231,11 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                 if _ok:
                     return _ip, _port, False
                 log("У вікні нічого не вибрано — пробую консольний шлях.")
-        elif pick:
-            log(f"Вікно пропущено: задано --pick {pick} (автовибір без вікна).")
-        elif not use_gui:
-            log("Вікно пропущено: режим --no-gui (тільки консоль). "
-                "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
+        elif not _window_tried:
+            if pick:
+                log(f"Вікно пропущено: задано --pick {pick} (автовибір без вікна).")
+            elif not use_gui:
+                log("Вікно пропущено: режим --no-gui (тільки консоль, див. START_CONSOLE.bat).")
         if allow_wireless:
             ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
                                                adb_port=adb_port,
@@ -3275,11 +3294,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
             if fast_ok:
                 save_last_phone(f"{lip}:{lport}")
                 return lip, lport, False
-        # Кабелю нема — вискакує ВІКНО зі знайденими телефонами (як Bluetooth):
-        # скан у фоні, клік → підключення, код парування — в тому ж вікні.
-        # Умова свідомо БЕЗ _gui_usable(): Electron-вкно tkinter не потребує,
-        # а відсутній tkinter з'ясується у fallback (там же і залогується).
-        if use_gui and not pick:
+        # Вікно вже показували на вході (_window_tried) — повторно не відкриваємо,
+        # далі тільки консольний флоу.
+        if use_gui and not pick and not _window_tried:
             log("Відкриваю вікно вибору пристрою...")
             try:
                 g = gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
@@ -3293,15 +3310,14 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                     return ip, port, False
                 log("Вікно закрито без вибору — НЕ йду в демо, пробую консольний шлях.")
                 use_gui = False  # щоб нижче не відкривати вікно повторно
-        elif not has_usb:
+        elif not _window_tried:
             # Вікно мало відкритись, але пропущено — пояснюємо чому, інакше
             # виглядає як «UI не відкривається» без жодної підказки.
             if pick:
                 log(f"Вікно пропущено: задано --pick {pick} (автовибір без вікна). "
                     "Приберіть --pick щоб побачити вікно.")
             elif not use_gui:
-                log("Вікно пропущено: режим --no-gui (тільки консоль). "
-                    "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
+                log("Вікно пропущено: режим --no-gui (тільки консоль, див. START_CONSOLE.bat).")
         # Без вікна (нема дисплея / --no-gui / --pick / вікно не допомогло):
         # консольний флоу.
         # СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
