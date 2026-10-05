@@ -70,8 +70,55 @@ exit /b %RC%
 
 :NOPYTHON
 echo [AUTO] ERROR: python not found in PATH.
-echo [AUTO] Install it with:  winget install Python.Python.3.12
-echo [AUTO] Then reopen this file by double-clicking it.
+echo [AUTO] Python is required to run this program.
+echo.
+where winget >nul 2>nul
+if errorlevel 1 goto :NOPYTHON_NOWINGET
+echo [AUTO] I can install Python automatically via winget (Python.Python.3.12, 1-3 min).
+set "INSTALL_PY="
+set /p INSTALL_PY="[AUTO] Install Python now? [Y/n]: "
+if /i "%INSTALL_PY%"=="n" goto :NOPYTHON_DECLINED
+if /i "%INSTALL_PY%"=="no" goto :NOPYTHON_DECLINED
+if /i "%INSTALL_PY%"=="N" goto :NOPYTHON_DECLINED
+echo [AUTO] Installing Python, please wait... (press Yes if Windows asks for permission)
+winget install --accept-source-agreements --accept-package-agreements -e --id Python.Python.3.12
+echo.
+echo [AUTO] Refreshing PATH for this session...
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`) do set "FRESHPATH=%%p"
+if defined FRESHPATH set "PATH=%FRESHPATH%;%PATH%"
+set "PY="
+where python >nul 2>nul
+if not errorlevel 1 set "PY=python"
+if not defined PY (
+  where py >nul 2>nul
+  if not errorlevel 1 set "PY=py -3"
+)
+if defined PY (
+  echo [AUTO] Python installed successfully, continuing...
+  echo.
+  goto :AUTO
+)
+echo [AUTO] ERROR: Python still not found after install.
+echo [AUTO] Close this window, open a NEW cmd window and run: python --version
+echo [AUTO] If it works, double-click START.bat again.
+echo [AUTO] Press any key to close this window...
+pause >nul
+exit /b 1
+
+:NOPYTHON_DECLINED
+echo [AUTO] OK, skipping auto-install.
+echo [AUTO] Install manually with:  winget install Python.Python.3.12
+echo [AUTO] Or from: https://www.python.org/downloads/
+echo [AUTO] Then double-click START.bat again.
+echo [AUTO] Press any key to close this window...
+pause >nul
+exit /b 1
+
+:NOPYTHON_NOWINGET
+echo [AUTO] Cannot auto-install: 'winget' not found on this system.
+echo [AUTO] Install manually from: https://www.python.org/downloads/
+echo [AUTO] (tick "Add python.exe to PATH" during setup)
+echo [AUTO] Then double-click START.bat again.
 echo [AUTO] Press any key to close this window...
 pause >nul
 exit /b 1

@@ -18,7 +18,9 @@ auto_run.py — ОДНА команда замість всіх ручних к�
     START.bat                             (подвійний клік, те саме що --mode auto)
 
 Що робить скрипт САМ (по кроках):
-  [0] Перевірка залежностей (adb, scrcpy, cmake) — за потреби підказує winget-команду
+  [0] Перевірка залежностей (adb, scrcpy, cmake) — якщо чогось бракує,
+      САМ пропонує довстановити через winget і питає підтвердження [Y/n]
+      (Enter=так, --install-deps/--yes=без питань, --no-install-deps=тільки підказки)
   [1] adb start-server
   [2] Пошук телефону: adb devices
       - якщо є USB device  -> adb tcpip 5555 -> визначення IP -> adb connect IP:5555
@@ -664,7 +666,7 @@ def find_binary(names):
             return w
     return None
 
-def ensure_built(skip_build, dry_run):
+def ensure_built(skip_build, dry_run, auto_yes=False, no_install=False):
     sender = find_binary(SENDER_NAMES)
     receiver = find_binary(RECEIVER_NAMES)
     if sender and receiver:
@@ -678,19 +680,22 @@ def ensure_built(skip_build, dry_run):
         return None, None
     log("Бінарників нема — запускаю збірку САМ (cmake)...")
     if not shutil.which("cmake"):
-        # В авто-режимі не падаємо одразу, а доустановлюємо самі (швидкий пакет, 1-3 хв).
-        # Може вискочити UAC-запит — це нормально, натисніть "Так" один раз.
-        log("cmake нема — доустановлюю САМ через winget (1-3 хв, може попросити UAC)...")
-        install_deps()
-    if not shutil.which("cmake"):
-        log("ERROR: 'cmake' так і не з'явився (можливо скасовано UAC або нема інтернету).")
+        # cmake вже пропонували встановити на кроці 0 (з підтвердженням).
+        # Тут повторно не ставимо мовчки — тільки підказка.
+        log("ERROR: 'cmake' нема (ви відмовились від автовстановлення або воно не вдалося).")
         log("Варіант 1 (автоматом): запустіть з прапорцем --install-deps")
         log("Варіант 2 (вручну): winget install Kitware.CMake")
         log("Варіант 3 (все разом): powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1")
         return None, None
     if not check_compiler():
-        log("ERROR: cmake є, але компілювати C++ нічим (MSVC не знайдено) — збірка неможлива.")
-        return None, None
+        if no_install:
+            log("ERROR: cmake є, але компілювати C++ нічим (MSVC не знайдено) — збірка неможлива.")
+            return None, None
+        # Важкий пакет — тільки з явної згоди (за замовчуванням default=Ні).
+        offer_install_compiler(auto_yes=auto_yes)
+        if not check_compiler():
+            log("ERROR: cmake є, але компілювати C++ нічим (MSVC не знайдено) — збірка неможлива.")
+            return None, None
     rc, _ = run(["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"], timeout=180)
     if rc != 0:
         log("ERROR: cmake configure не вдався.")
@@ -3529,13 +3534,16 @@ def install_deps():
     """Самому доустановити відсутнє через winget (швидкі пакети, без компілятора)."""
     if os.name != "nt" or not shutil.which("winget"):
         log("winget не знайдено — встановіть залежності вручну (див. README).")
-        return
+        return False
+    installed_any = False
     for tool, pkg in WINGET_PKGS:
         if shutil.which(tool):
             continue
-        log(f"Доустанавливаю {tool} САМ: winget install {pkg} ... (це займе 1-3 хв)")
-        run(["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
+        log(f"Довстановлюю {tool} САМ: winget install {pkg} ... (це займе 1-3 хв)")
+        rc, _ = run(["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
              "-e", "--id", pkg], timeout=600)
+        if rc == 0:
+            installed_any = True
     # оновити PATH поточної сесії з машинного/користувацького оточення
     log("Оновлюю PATH сесії...")
     try:
@@ -3548,6 +3556,70 @@ def install_deps():
             os.environ["Path"] = r.stdout.strip() + ";" + os.environ.get("Path", "")
     except Exception:
         pass
+    return installed_any
+
+
+def ask_yes_no(question, default_yes=True):
+    """Питання Y/n з підтвердженням. Повертає True тільки при явній згоді.
+
+    Порожній ввід (просто Enter) = default_yes. Будь-яке незрозуміле = Ні
+    (безпечно: нічого не встановлюємо без явної згоди).
+    Працює тільки в інтерактивному терміналі, інакше повертає False.
+    """
+    if not _stdin_interactive():
+        return False
+    suffix = " [Y/n]: " if default_yes else " [y/N]: "
+    try:
+        # Навмисно НЕ використовуємо _prompt(): він перетворює EOF на "",
+        # що невідрізнити від Enter. А при закритому stdin (CI/пайп) ставити
+        # нічого не можна — тільки явна згода живої людини.
+        ans = input(question + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    except Exception:
+        return False
+    if not ans:
+        return bool(default_yes)
+    if ans in ("y", "yes", "yep", "yeah", "т", "так", "та", "да", "д", "ага", "1", "+"):
+        return True
+    return False
+
+
+def offer_install_missing_deps(missing, auto_yes=False):
+    """Запропонувати довстановити відсутнє через winget, спитавши підтвердження.
+
+    missing: список (tool, winget_id). auto_yes=True — встановити без питань
+    (режим --install-deps / --yes). Повертає True якщо встановлення виконано
+    (або спробовано), False якщо користувач відмовився / нема winget / неінтерактивно.
+    """
+    if not missing:
+        return False
+    names = ", ".join(t for t, _ in missing)
+    log(f"Бракує: {names}.")
+    if os.name != "nt" or not shutil.which("winget"):
+        log("Автовстановлення можливе тільки на Windows з winget.")
+        for tool, pkg in missing:
+            log(f"  Вручну: winget install {pkg}")
+        return False
+    if auto_yes:
+        log("Автовстановлення увімкнено прапорцем — ставлю без питань...")
+        install_deps()
+        return True
+    if not _stdin_interactive():
+        log("Неінтерактивний режим — пропускаю автовстановлення.")
+        for tool, pkg in missing:
+            log(f"  Вручну: winget install {pkg}  (або запустіть з --install-deps)")
+        return False
+    log(f"Можу довстановити САМ через winget ({names}, 1-3 хв, може попросити UAC).")
+    if ask_yes_no("Встановити відсутнє автоматично?", default_yes=True):
+        log("Ок, встановлюю...")
+        install_deps()
+        return True
+    log("Ок, пропускаю автовстановлення. Продовжую з тим що є.")
+    for tool, pkg in missing:
+        log(f"  Коли буде час: winget install {pkg}  (або START.bat install)")
+    return False
 
 def check_compiler():
     """Чи є чим компілювати C++ (MSVC). Повертає True якщо компілятор знайдено."""
@@ -3572,6 +3644,38 @@ def check_compiler():
     log("    winget install Microsoft.VisualStudio.2022.BuildTools --override "
         "\"--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended\"")
     return False
+
+
+def offer_install_compiler(auto_yes=False):
+    """Запропонувати встановити MSVC Build Tools (важкий пакет!) з підтвердженням.
+
+    Повертає True якщо встановлення спробовано, False якщо відмова/неможливо.
+    """
+    if os.name != "nt" or not shutil.which("winget"):
+        log("Автовстановлення компілятора можливе тільки на Windows з winget.")
+        return False
+    if check_compiler():
+        return False
+    log("УВАГА: Build Tools це 3-8 ГБ і 10-30 хв, ставиться ОДИН раз. Буде UAC-запит.")
+    do_it = bool(auto_yes)
+    if not do_it:
+        if not _stdin_interactive():
+            log("Неінтерактивний режим — компілятор не ставлю (запустіть з --install-deps щоб ставити без питань).")
+            return False
+        do_it = ask_yes_no("Встановити Visual Studio Build Tools з C++ зараз?", default_yes=False)
+    if not do_it:
+        log("Ок, без компілятора збірка C++ неможлива — продовжую без неї (fallback через scrcpy по TCP, якщо телефон вже по Wi-Fi).")
+        return False
+    log("Ставлю Build Tools САМ (довго, не закривайте вікно)...")
+    run(["winget", "install", "--accept-source-agreements", "--accept-package-agreements",
+         "-e", "--id", "Microsoft.VisualStudio.2022.BuildTools", "--override",
+         "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
+        timeout=3600)
+    if check_compiler():
+        log("Компілятор з'явився — продовжую збірку.")
+        return True
+    log("Компілятор так і не знайдено (можливо потрібен перезапуск консолі).")
+    return True
 
 # ---------------- процеси ----------------
 
@@ -3647,7 +3751,11 @@ def main():
     ap.add_argument("--check", action="store_true", help="Тільки перевірити залежності і вийти")
     ap.add_argument("--dry-run", action="store_true", help="Тільки показати команди, нічого не запускати")
     ap.add_argument("--install-deps", action="store_true",
-                    help="Самому доустановити відсутнє (cmake/adb/scrcpy) через winget")
+                    help="Самому доустановити відсутнє (cmake/adb/scrcpy) через winget БЕЗ питань")
+    ap.add_argument("--no-install-deps", action="store_true",
+                    help="Ніколи не пропонувати автовстановлення (тільки перевірка + підказки)")
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help="На всі питання про довстановлення відповідати ТАК (для скриптів)")
     ap.add_argument("--scan", action="store_true",
                     help="Примусово просканувати всю LAN і запропонувати вибір пристрою (з назвою), "
                          "навіть якщо телефон вже підключено")
@@ -3710,8 +3818,12 @@ def main():
 
     print("=== Virtual USB Cable — АВТОПІЛОТ (сам вводить всі команди) ===", flush=True)
 
-    # [0] залежності (+ опційне довстановлення)
-    if args.install_deps and not args.dry_run:
+    # [0] залежності (+ довстановлення з підтвердженням)
+    # --install-deps / --yes = ставити мовчки; --no-install-deps = тільки підказки;
+    # за замовчуванням в інтерактивному терміналі ПИТАЄМО, в неінтерактиві — тільки підказки.
+    auto_yes = bool(getattr(args, "install_deps", False) or getattr(args, "yes", False))
+    no_install = bool(getattr(args, "no_install_deps", False))
+    if auto_yes and not args.dry_run and not no_install:
         install_deps()
     log("Крок 0: перевірка залежностей...")
     has_adb = shutil.which("adb") is not None
@@ -3722,6 +3834,16 @@ def main():
     log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (winget install Genymobile.scrcpy або --install-deps)'}")
     log(f"  cmake: {'OK' if has_cmake else 'НЕМА (winget install Kitware.CMake або --install-deps)'}")
     log(f"  python: OK ({sys.version.split()[0]})")
+    if (not has_adb or not has_scrcpy or not has_cmake) and not args.dry_run and not no_install:
+        missing = [(t, p) for t, p in WINGET_PKGS if not shutil.which(t)]
+        if missing:
+            offer_install_missing_deps(missing, auto_yes=auto_yes)
+            # перечитати після можливого встановлення
+            has_adb = shutil.which("adb") is not None
+            has_scrcpy = shutil.which("scrcpy") is not None
+            has_cmake = shutil.which("cmake") is not None
+            log(f"  повторна перевірка: adb={'OK' if has_adb else 'НЕМА'} "
+                f"scrcpy={'OK' if has_scrcpy else 'НЕМА'} cmake={'OK' if has_cmake else 'НЕМА'}")
     if args.check:
         check_compiler()
         return 0 if (has_adb and has_scrcpy) else 1
@@ -3781,7 +3903,8 @@ def main():
 
     # [3] збірка
     log("Крок 3: збірка (якщо треба, САМ)...")
-    sender_bin, receiver_bin = ensure_built(args.skip_build, args.dry_run)
+    sender_bin, receiver_bin = ensure_built(args.skip_build, args.dry_run,
+                                            auto_yes=auto_yes, no_install=no_install)
     if args.dry_run:
         log("(dry-run) далі тільки показую команди запуску:")
         log_cmd(f"agent_sender --adb {adb_host}:{adb_port_eff} --listen 0.0.0.0:{args.sender_port}"
