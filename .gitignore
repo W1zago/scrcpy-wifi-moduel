@@ -2,4 +2,6 @@ node_modules/
 ui/node_modules/ 
 # стан рантайму (останній пристрій) — не комітити
 build/last_phone.txt
-scrcpy-wifi-module-*.zip
+# всі zip-архіви — не комітити, щоб не було видно на GitHub
+*.zip
+*.ZIP
