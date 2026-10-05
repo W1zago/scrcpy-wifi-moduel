@@ -2025,16 +2025,30 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
 
     ui_dir = ROOT / "ui"
     if not (ui_dir / "package.json").exists():
+        log("Electron UI пропущено: нема ui/package.json "
+            f"(шукав {ui_dir}). Запускайте з кореня репозиторію.")
         return None
 
     electron_exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
     if electron_exe.exists():
         cmd = [str(electron_exe), str(ui_dir), "--parent-python"]
     else:
+        if not (ui_dir / "node_modules").exists():
+            log("Electron UI: нема ui/node_modules — CyberDeck без нього не стартує. "
+                "Одноразово виконайте: cd ui && npm install "
+                "(потрібен Node.js LTS з https://nodejs.org). "
+                "Поки що переходжу на стандартне вікно...")
         npm_bin = shutil.which("npm.cmd") or shutil.which("npm") or shutil.which("npx.cmd") or shutil.which("npx")
         if not npm_bin:
+            log("Electron UI пропущено: не знайдено npm/npx в PATH "
+                "(встановіть Node.js LTS з https://nodejs.org). "
+                "Переходжу на стандартне вікно...")
             return None
         cmd = [npm_bin, "--prefix", str(ui_dir), "start", "--", "--parent-python"]
+        if os.name == "nt" and str(npm_bin).lower().endswith((".cmd", ".bat")):
+            # .cmd/.bat не запускаються напряму через CreateProcess —
+            # виконуємо через cmd /c, інакше вікно мовчки не стартує.
+            cmd = ["cmd", "/c"] + cmd
 
     log("Відкриваю CyberDeck Electron UI...")
     # TCP-сокет для подій бекенд->вікно (stdin в Electron на Windows глухий:
@@ -2453,8 +2467,35 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
 
     time.sleep(0.5)
     if proc.poll() is not None:
-        log("Electron не зміг стартувати — переходжу на стандартне вікно...")
+        rc = proc.poll()
+        err_tail = ""
+        try:
+            # Процес вже завершився — збираємо залишок stderr для діагностики.
+            _rest = proc.stderr.read() or ""
+            err_tail = _rest.strip().splitlines()
+            err_tail = "\n".join(err_tail[-15:])
+        except Exception:
+            pass
+        log(f"Electron не зміг стартувати (код {rc}) — переходжу на стандартне вікно...")
+        if err_tail:
+            log(f"Причина з stderr: {err_tail[:1500]}")
+        else:
+            log("Підказка: найчастіше це нема ui/node_modules — виконайте: cd ui && npm install. "
+                "Або подивіться повний лог вище ([UI]/[UI-ERR]).")
         return None
+
+    def _drain_stderr():
+        # stderr інакше ніколи не читається: при verbose-логах Electron труба
+        # переповнюється і вікно зависає. Зливаємо в [UI-ERR].
+        try:
+            for _line in proc.stderr:
+                _line = (_line or "").strip()
+                if _line:
+                    print(f"[UI-ERR] {_line}", flush=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
 
     log("CyberDeck Electron UI відкрито.")
     while proc.poll() is None and not result['done']:
@@ -2489,6 +2530,7 @@ def gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pai
                                         scan_ports=scan_ports)
     if res is not None:
         return res
+    log("CyberDeck недоступний — відкриваю стандартне вікно (tkinter)...")
     return _tkinter_gui_pick_and_connect(adb_port, mdns_timeout, scan_timeout, pair_code,
                                          scan_ports=scan_ports)
 
@@ -3209,6 +3251,20 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
                     return ip, port, False
                 log("Вікно закрито без вибору — НЕ йду в демо, пробую консольний шлях.")
                 use_gui = False  # щоб нижче не відкривати вікно повторно
+        elif not has_usb:
+            # Вікно мало відкритись, але пропущено — пояснюємо чому, інакше
+            # виглядає як «UI не відкривається» без жодної підказки.
+            if pick:
+                log(f"Вікно пропущено: задано --pick {pick} (автовибір без вікна). "
+                    "Приберіть --pick щоб побачити вікно.")
+            elif not use_gui:
+                log("Вікно пропущено: режим --no-gui (тільки консоль). "
+                    "Приберіть --no-gui або додайте --gui щоб побачити вікно.")
+            elif not _gui_usable():
+                log("Вікно пропущено: в цьому Python нема tkinter. "
+                    "Перевстановіть Python з https://www.python.org/downloads/ "
+                    "(під час встановлення лишіть опцію 'tcl/tk and IDLE'). "
+                    "Поки що продовжую в консолі.")
         # Без вікна (нема дисплея / --no-gui / --pick / вікно не допомогло):
         # консольний флоу.
         # СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
@@ -3678,6 +3734,31 @@ def check_compiler():
     return False
 
 
+def check_gui():
+    """Діагностика вікон: tkinter (стандартне) + Node/Electron (CyberDeck)."""
+    log("  --- вікна (GUI) ---")
+    try:
+        import tkinter  # noqa: F401
+        log("  tkinter: OK (стандартне вікно працюватиме)")
+    except ImportError:
+        log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
+            "Перевстановіть Python з https://www.python.org/downloads/ "
+            "(лишіть опцію 'tcl/tk and IDLE').")
+    ui_dir = ROOT / "ui"
+    log(f"  ui/package.json: {'OK' if (ui_dir / 'package.json').exists() else 'НЕМА (запуск не з кореня репозиторію?)'}")
+    _exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    if _exe.exists():
+        log("  electron: OK (CyberDeck вікно працюватиме)")
+    else:
+        log("  electron: НЕМА — для CyberDeck вікна одноразово: cd ui && npm install "
+            "(потрібен Node.js LTS з https://nodejs.org). "
+            "Без нього працюватиме стандартне вікно (tkinter).")
+    _node = shutil.which("node")
+    _npm = shutil.which("npm.cmd") or shutil.which("npm")
+    log(f"  node: {_node if _node else 'НЕМА (https://nodejs.org)'}")
+    log(f"  npm: {_npm if _npm else 'НЕМА (https://nodejs.org)'}")
+
+
 def offer_install_compiler(auto_yes=False):
     """Запропонувати встановити MSVC Build Tools (важкий пакет!) з підтвердженням.
 
@@ -3878,6 +3959,7 @@ def main():
                 f"scrcpy={'OK' if has_scrcpy else 'НЕМА'} cmake={'OK' if has_cmake else 'НЕМА'}")
     if args.check:
         check_compiler()
+        check_gui()
         return 0 if (has_adb and has_scrcpy) else 1
     if not has_adb and args.mode == "real":
         log("ERROR: для --mode real потрібен adb.")
