@@ -1796,7 +1796,8 @@ def _wireless_do_pair(ip, pair_port, pair_code):
     return adb_pair_verify(ip, pair_port, code)
 
 
-def _wireless_manual(pair_code):
+def _wireless_manual(pair_code, adb_port=DEFAULT_ADB_PORT, extra_ports=None,
+                     mdns_timeout=2.0):
     """Ручне введення: питаємо ТІЛЬКИ IP (порти підбираємо самі, код — якщо треба).
 
     Повертає (ip, port, ok). Старі поля портів лишили як запасний шлях.
@@ -1810,7 +1811,10 @@ def _wireless_manual(pair_code):
     if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         log("Схоже не на IP — пропускаю.")
         return "", 0, False
-    port, ok = guided_connect_by_ip(ip, pair_code=pair_code)
+    port, ok = guided_connect_by_ip(ip, pair_code=pair_code,
+                                    extra_ports=extra_ports,
+                                    adb_port=adb_port,
+                                    mdns_timeout=mdns_timeout)
     if ok:
         return ip, port, True
     # Запасний шлях: порти з екрану (раптом автопідбір не взяв)
@@ -1835,7 +1839,8 @@ def _wireless_manual(pair_code):
     return "", 0, False
 
 
-def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
+def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None,
+                        adb_port=DEFAULT_ADB_PORT, extra_ports=None):
     """Підключення БЕЗ кабелю через Бездротове налагодження. Повертає (ip, port, ok)."""
     log("")
     log("Шукаю телефон по Wi-Fi БЕЗ кабелю (mDNS, Бездротове налагодження)...")
@@ -1856,7 +1861,10 @@ def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
             "з екрану знадобиться тільки код.")
         if pick and re.match(r"^\d+\.\d+\.\d+\.\d+$", str(pick)):
             log(f"--pick схоже на IP, підбираю порти для {pick} сам...")
-            port, ok = guided_connect_by_ip(str(pick), pair_code=pair_code)
+            port, ok = guided_connect_by_ip(str(pick), pair_code=pair_code,
+                                            extra_ports=extra_ports,
+                                            adb_port=adb_port,
+                                            mdns_timeout=mdns_timeout)
             if ok:
                 return str(pick), port, True
             return "", 0, False
@@ -1869,9 +1877,13 @@ def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
             if alive:
                 log("Знаходжу живі хости сам — виберіть зі списку свій телефон.")
                 try:
-                    _iports = get_scan_ports(adb_port, include_last=True)
+                    _iports = get_scan_ports(adb_port, extra_ports=extra_ports,
+                                             include_last=True)
                 except Exception:
-                    _iports = [adb_port]
+                    try:
+                        _iports = [int(adb_port)]
+                    except Exception:
+                        _iports = [DEFAULT_ADB_PORT]
                 try:
                     identified = identify_hosts(alive, _iports)
                 except Exception:
@@ -1885,17 +1897,25 @@ def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
                                                    adb_port)
                             cport = int(_p)
                         except Exception:
-                            cport = adb_port
+                            try:
+                                cport = int(adb_port)
+                            except Exception:
+                                cport = DEFAULT_ADB_PORT
                         if adb_connect_fast(chosen, cport, timeout=5.0):
                             save_last_phone(f"{chosen}:{cport}")
                             return chosen, cport, True
-                    port, ok = guided_connect_by_ip(chosen, pair_code=pair_code)
+                    port, ok = guided_connect_by_ip(chosen, pair_code=pair_code,
+                                                    extra_ports=extra_ports,
+                                                    adb_port=adb_port,
+                                                    mdns_timeout=mdns_timeout)
                     if ok:
                         return chosen, port, True
                     return "", 0, False
             ans = _prompt("Ввести IP вручну з екрану телефону? (так/ні): ").lower()
             if ans in ("так", "да", "y", "yes", "т", "д", ""):
-                return _wireless_manual(pair_code)
+                return _wireless_manual(pair_code, adb_port=adb_port,
+                                        extra_ports=extra_ports,
+                                        mdns_timeout=mdns_timeout)
         return "", 0, False
     action, dev = interactive_pick_wireless(conns, pairs, pair_code, pick)
     if action == "connect":
@@ -1920,7 +1940,9 @@ def _try_wireless_debug(mdns_timeout=2.5, pair_code=None, pick=None):
                 save_last_phone(f"{dev['ips'][0]}:{cport}")
                 return dev["ips"][0], int(cport), True
             return "", 0, False
-        return _wireless_manual(pair_code)
+        return _wireless_manual(pair_code, adb_port=adb_port,
+                                extra_ports=extra_ports,
+                                mdns_timeout=mdns_timeout)
     return "", 0, False
 
 
@@ -3026,7 +3048,9 @@ def _try_lan_scan_pick(adb_port, scan_timeout, pick, scan_ports=None, mdns_timeo
             if adb_connect_fast(chosen_ip, chosen_port, timeout=5.0):
                 save_last_phone(f"{chosen_ip}:{chosen_port}")
                 return chosen_ip, chosen_port, True
-        port, ok = guided_connect_by_ip(chosen_ip)
+        port, ok = guided_connect_by_ip(chosen_ip, adb_port=adb_port,
+                                        extra_ports=scan_ports,
+                                        mdns_timeout=mdns_timeout)
         if ok:
             return chosen_ip, port, True
         return "", adb_port, False
@@ -3112,7 +3136,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
         # --scan: навіть якщо щось вже підключено, показуємо ВСІ доступні IP і даємо вибрати
         log(f"Примусове сканування (--scan): вже підключено {already_tcp}, але дивлюсь всі IP в мережі...")
         if allow_wireless:
-            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
+                                               adb_port=adb_port,
+                                               extra_ports=scan_ports)
             if ok:
                 return ip, port, False
         if allow_scan:
@@ -3188,7 +3214,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
         # СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
         # і тільки потім класичний скан порту 5555 (для тих хто вже робив tcpip по USB).
         if allow_wireless:
-            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
+                                               adb_port=adb_port,
+                                               extra_ports=scan_ports)
             if ok:
                 return ip, port, False
         if allow_scan:
@@ -3219,7 +3247,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
     if not candidates:
         log("Не визначив IP через USB. Пробую БЕЗ кабелю, потім скан мережі...")
         if allow_wireless:
-            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+            ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
+                                               adb_port=adb_port,
+                                               extra_ports=scan_ports)
             if ok:
                 return ip, port, False
         if allow_scan:
@@ -3239,7 +3269,9 @@ def setup_phone_wifi(adb_port, phone_ip_override, dry_run, devs=None,
     if allow_wireless:
         log("")
         log("USB-кандидати не підійшли. Пробую БЕЗ кабелю (Бездротове налагодження)...")
-        ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick)
+        ip, port, ok = _try_wireless_debug(mdns_timeout, pair_code, pick,
+                                           adb_port=adb_port,
+                                           extra_ports=scan_ports)
         if ok:
             return ip, port, False
     if allow_scan:
