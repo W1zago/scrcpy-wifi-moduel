@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# setup_linux.sh — One-time setup of a Linux host (Debian/Ubuntu).
+# setup_linux.sh — One-time setup of a Linux host (Debian/Ubuntu via apt,
+# Arch via pacman).
 # Run:  bash scripts/setup_linux.sh
 # What it does:
-#   1. apt-get install: python3, python3-tk, cmake, build-essential,
-#      adb (android-tools-adb), scrcpy, nodejs, npm, usbip (linux-tools-generic)
+#   1. Installs: python3, tkinter bindings, cmake, C++ compiler,
+#      adb, scrcpy, nodejs, npm, usbip tools
 #   2. Loads vhci-hcd kernel module (virtual USB, no Test Signing needed)
 #   3. adb start-server + adb devices (check)
 set -u
@@ -12,13 +13,6 @@ cd "$(dirname "$0")/.."
 step() { echo; echo "[AUTO] $1"; }
 ok()   { echo "[AUTO] OK: $1"; }
 warn() { echo "[AUTO] WARN: $1"; }
-
-if ! command -v apt-get >/dev/null 2>&1; then
-  warn "apt-get not found — this script targets Debian/Ubuntu."
-  echo "[AUTO] Install manually: python3, python3-tk, cmake, build-essential,"
-  echo "[AUTO]   android-tools-adb, scrcpy, nodejs, npm, linux-tools-generic"
-  exit 1
-fi
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -29,12 +23,29 @@ if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
 fi
 
-step "Step 1/3: packages via apt-get..."
-# shellcheck disable=SC2086
-$SUDO apt-get update
-# shellcheck disable=SC2086
-$SUDO apt-get install -y python3 python3-tk cmake build-essential \
-  android-tools-adb scrcpy nodejs npm linux-tools-generic
+if command -v apt-get >/dev/null 2>&1; then
+  PM="apt"
+elif command -v pacman >/dev/null 2>&1; then
+  PM="pacman"
+else
+  warn "Neither apt-get nor pacman found — this script targets Debian/Ubuntu and Arch."
+  echo "[AUTO] Install manually: python3 (+tk), cmake, C++ compiler,"
+  echo "[AUTO]   adb (android-tools), scrcpy, nodejs, npm, usbip tools"
+  exit 1
+fi
+
+step "Step 1/3: packages via $PM..."
+if [ "$PM" = "apt" ]; then
+  # shellcheck disable=SC2086
+  $SUDO apt-get update
+  # shellcheck disable=SC2086
+  $SUDO apt-get install -y python3 python3-tk cmake build-essential \
+    android-tools-adb scrcpy nodejs npm linux-tools-generic
+else
+  # shellcheck disable=SC2086
+  $SUDO pacman -S --needed --noconfirm python tk cmake base-devel \
+    android-tools scrcpy nodejs npm usbip
+fi
 
 for t in python3 cmake adb scrcpy node npm; do
   if command -v "$t" >/dev/null 2>&1; then ok "$t installed."; else warn "$t still missing."; fi

@@ -716,7 +716,7 @@ def ensure_built(skip_build, dry_run, auto_yes=False, no_install=False):
             log("Варіант 2 (вручну): winget install Kitware.CMake")
             log("Варіант 3 (все разом): powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1")
         else:
-            log("Варіант 2 (вручну): sudo apt-get install -y cmake build-essential")
+            log(f"Варіант 2 (вручну): {_manual_install_cmd('cmake', 'build-essential')}")
             log("Варіант 3 (все разом): bash scripts/setup_linux.sh")
         return None, None
     if not check_compiler():
@@ -3694,7 +3694,7 @@ def check_vhci():
                 "(sudo modprobe vhci-hcd для віртуального USB).")
         else:
             log("VHCI: нема vhci-hcd/usbip — буде робота через scrcpy по TCP "
-                "(пакет linux-tools-generic дає usbip: sudo apt-get install -y linux-tools-generic).")
+                f"(usbip дає пакет: {_manual_install_cmd('linux-tools-generic')}).")
         return False
     for dev in (r"\\.\vhci", r"\\.\USBIP_VHCI"):
         try:
@@ -3728,30 +3728,70 @@ APT_PKGS = (
     ("scrcpy", "scrcpy"),
 )
 
+# Linux (Arch): tool -> pacman-пакет.
+PACMAN_PKGS = (
+    ("cmake", "cmake"),
+    ("adb", "android-tools"),
+    ("scrcpy", "scrcpy"),
+)
+
+
+def _linux_pkg_mgr():
+    """Менеджер пакетів Linux: 'apt', 'pacman' або None."""
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("pacman"):
+        return "pacman"
+    return None
+
+
+def _manual_install_cmd(*pkgs):
+    """Команда ручного встановлення пакетів під поточну ОС (для підказок)."""
+    if os.name == "nt":
+        return "winget install " + " ".join(pkgs)
+    if _linux_pkg_mgr() == "pacman":
+        conv = {"android-tools-adb": "android-tools",
+                "build-essential": "base-devel",
+                "python3-tk": "tk",
+                "linux-tools-generic": "usbip",
+                "cmake build-essential": "cmake base-devel"}
+        pkgs = [conv.get(p, p) for p in pkgs]
+        return "sudo pacman -S --needed " + " ".join(pkgs)
+    return "sudo apt-get install -y " + " ".join(pkgs)
+
 
 def _os_pkgs():
-    """Таблиця (tool, pkg-id) під поточну ОС."""
-    return WINGET_PKGS if os.name == "nt" else APT_PKGS
+    """Таблиця (tool, pkg-id) під поточну ОС і менеджер пакетів."""
+    if os.name == "nt":
+        return WINGET_PKGS
+    return PACMAN_PKGS if _linux_pkg_mgr() == "pacman" else APT_PKGS
 
 
 def install_linux_deps():
-    """Самому доустановити відсутнє через apt (Debian/Ubuntu)."""
-    if not shutil.which("apt-get"):
-        log("apt-get не знайдено — встановіть залежності вручну (див. README).")
+    """Самому доустановити відсутнє (apt на Debian/Ubuntu, pacman на Arch)."""
+    mgr = _linux_pkg_mgr()
+    table = APT_PKGS if mgr == "apt" else (PACMAN_PKGS if mgr == "pacman" else ())
+    if not table:
+        log("Нема apt-get/pacman — встановіть залежності вручну (див. README).")
         return False
-    missing_pkgs = [pkg for tool, pkg in APT_PKGS if not shutil.which(tool)]
+    missing_pkgs = [pkg for tool, pkg in table if not shutil.which(tool)]
     if not missing_pkgs:
         return False
     if os.geteuid() != 0 and not shutil.which("sudo"):
-        log("Потрібен root або sudo для apt-get — встановіть вручну: "
-            f"sudo apt-get install -y {' '.join(missing_pkgs)}")
+        log("Потрібен root або sudo — встановіть вручну: "
+            f"{_manual_install_cmd(*missing_pkgs)}")
         return False
     prefix = [] if os.geteuid() == 0 else ["sudo"]
-    log(f"Довстановлюю САМ: apt-get install -y {' '.join(missing_pkgs)} ...")
-    rc, _ = run(prefix + ["apt-get", "update"], timeout=300)
-    if rc != 0:
-        log("apt-get update не вдався — далі пробую встановити як є.")
-    rc, _ = run(prefix + ["apt-get", "install", "-y"] + missing_pkgs, timeout=600)
+    if mgr == "apt":
+        log(f"Довстановлюю САМ: apt-get install -y {' '.join(missing_pkgs)} ...")
+        rc, _ = run(prefix + ["apt-get", "update"], timeout=300)
+        if rc != 0:
+            log("apt-get update не вдався — далі пробую встановити як є.")
+        rc, _ = run(prefix + ["apt-get", "install", "-y"] + missing_pkgs, timeout=600)
+    else:
+        log(f"Довстановлюю САМ: pacman -S --needed {' '.join(missing_pkgs)} ...")
+        rc, _ = run(prefix + ["pacman", "-S", "--needed", "--noconfirm"] + missing_pkgs,
+                     timeout=600)
     return rc == 0
 
 
@@ -3825,11 +3865,13 @@ def offer_install_missing_deps(missing, auto_yes=False):
     names = ", ".join(t for t, _ in missing)
     log(f"Бракує: {names}.")
     if os.name != "nt":
-        if not shutil.which("apt-get"):
-            log("Автовстановлення можливе через apt-get (Debian/Ubuntu).")
+        mgr = _linux_pkg_mgr()
+        if mgr is None:
+            log("Автовстановлення: підтримуються apt-get (Debian/Ubuntu) і pacman (Arch).")
             for tool, pkg in missing:
-                log(f"  Вручну: sudo apt-get install -y {pkg}")
+                log(f"  Вручну: встановіть пакет з {tool} ({pkg})")
             return False
+        manual_word = "apt-get" if mgr == "apt" else "pacman"
         if auto_yes:
             log("Автовстановлення увімкнено прапорцем — ставлю без питань...")
             install_linux_deps()
@@ -3837,16 +3879,16 @@ def offer_install_missing_deps(missing, auto_yes=False):
         if not _stdin_interactive():
             log("Неінтерактивний режим — пропускаю автовстановлення.")
             for tool, pkg in missing:
-                log(f"  Вручну: sudo apt-get install -y {pkg}  (або запустіть з --install-deps)")
+                log(f"  Вручну: {_manual_install_cmd(pkg)}  (або запустіть з --install-deps)")
             return False
-        log(f"Можу довстановити САМ через apt-get ({names}, знадобиться sudo).")
+        log(f"Можу довстановити САМ через {manual_word} ({names}, знадобиться sudo).")
         if ask_yes_no("Встановити відсутнє автоматично?", default_yes=True):
             log("Ок, встановлюю...")
             install_linux_deps()
             return True
         log("Ок, пропускаю автовстановлення. Продовжую з тим що є.")
         for tool, pkg in missing:
-            log(f"  Коли буде час: sudo apt-get install -y {pkg}  (або ./START.sh install)")
+            log(f"  Коли буде час: {_manual_install_cmd(pkg)}  (або ./START.sh install)")
         return False
     if not shutil.which("winget"):
         log("Автовстановлення можливе тільки на Windows з winget.")
@@ -3880,7 +3922,7 @@ def check_compiler():
                 log(f"  compiler ({cc}): OK")
                 return True
         log("  compiler: НЕМА — для збірки C++ потрібен компілятор.")
-        log("    sudo apt-get install -y build-essential cmake")
+        log(f"    {_manual_install_cmd('cmake', 'build-essential')}")
         return False
     if shutil.which("cl") or shutil.which("msbuild"):
         log("  compiler (MSVC): OK")
@@ -3918,7 +3960,7 @@ def check_gui():
                 "(лишіть опцію 'tcl/tk and IDLE').")
         else:
             log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
-                "Встановіть: sudo apt-get install -y python3-tk")
+                f"Встановіть: {_manual_install_cmd('python3-tk')}")
     ui_dir = ROOT / "ui"
     log(f"  ui/package.json: {'OK' if (ui_dir / 'package.json').exists() else 'НЕМА (запуск не з кореня репозиторію?)'}")
     _exe = _electron_bin_path(ui_dir)
@@ -4149,9 +4191,9 @@ def main():
         log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (winget install Genymobile.scrcpy або --install-deps)'}")
         log(f"  cmake: {'OK' if has_cmake else 'НЕМА (winget install Kitware.CMake або --install-deps)'}")
     else:
-        log(f"  adb: {'OK' if has_adb else 'НЕМА (sudo apt-get install -y android-tools-adb або --install-deps)'}")
-        log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (sudo apt-get install -y scrcpy або --install-deps)'}")
-        log(f"  cmake: {'OK' if has_cmake else 'НЕМА (sudo apt-get install -y cmake build-essential або --install-deps)'}")
+        log(f"  adb: {'OK' if has_adb else 'НЕМА (' + _manual_install_cmd('android-tools-adb') + ' або --install-deps)'}")
+        log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (' + _manual_install_cmd('scrcpy') + ' або --install-deps)'}")
+        log(f"  cmake: {'OK' if has_cmake else 'НЕМА (' + _manual_install_cmd('cmake', 'build-essential') + ' або --install-deps)'}")
     log(f"  python: OK ({sys.version.split()[0]})")
     if (not has_adb or not has_scrcpy or not has_cmake) and not args.dry_run and not no_install:
         missing = [(t, p) for t, p in _os_pkgs() if not shutil.which(t)]
@@ -4355,7 +4397,8 @@ def main():
             if os.name == "nt":
                 log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: winget install Genymobile.scrcpy")
             else:
-                log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: sudo apt-get install -y scrcpy")
+                log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. "
+                    f"Встановіть: {_manual_install_cmd('scrcpy')}")
         else:
             log(f"Крок 7: запускаю scrcpy САМ: {' '.join(scrcpy_cmd)} ...")
             try:

@@ -11,6 +11,8 @@
  *  - На відміну від adb_bridge, тут ми бачимо СПРАВЖНІ USB дескриптори, а не ADB messages
  */
 
+#include <cstdio>
+
 #if 0 // Вимкнено для No-Root PoC — вмикається при #define USE_GADGET
 
 #include "../common/protocol.h"

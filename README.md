@@ -246,7 +246,8 @@ Then use it exactly like on Windows:
 ./START.sh check      # diagnostics (adb/scrcpy/cmake/compiler/GUI block)
 ```
 
-Missing pieces install themselves on request (`sudo apt-get install -y ...`).
+Missing pieces install themselves on request (`sudo apt-get install -y ...`
+on Debian/Ubuntu, `sudo pacman -S --needed ...` on Arch).
 Notes: the C++ `agent_sender` builds with gcc via the same CMake project
 (`agent_receiver` is Windows-only — on Linux mirroring goes over scrcpy TCP,
 no Test Signing needed since VHCI is the in-kernel `vhci-hcd` module).
