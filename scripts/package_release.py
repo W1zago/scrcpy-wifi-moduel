@@ -10,7 +10,6 @@
 LICENSE і зібрані бінарники з build/ (якщо є).
 """
 import argparse
-import shutil
 import sys
 import tarfile
 import zipfile
@@ -25,9 +24,13 @@ ALWAYS = ["tools", "ui", "scripts", "src", "CMakeLists.txt", "README.md",
 
 SKIP_DIRS = {"__pycache__", "node_modules", ".git"}
 SKIP_SUFFIXES = (".pyc",)
+# Файли чужої ОС не пакуються, щоб не було мішанини в архівах.
+SKIP_SUFFIXES_WIN = SKIP_SUFFIXES + (".sh",)
+SKIP_SUFFIXES_LINUX = SKIP_SUFFIXES + (".bat", ".cmd", ".ps1")
 
 
 def collect(platform):
+    skip_suffixes = SKIP_SUFFIXES_WIN if platform == "win" else SKIP_SUFFIXES_LINUX
     files = []
     for name in (WIN_LAUNCHERS if platform == "win" else LINUX_LAUNCHERS):
         p = ROOT / name
@@ -36,6 +39,8 @@ def collect(platform):
     for name in ALWAYS:
         p = ROOT / name
         if p.is_file():
+            if p.suffix in skip_suffixes:
+                continue
             files.append(p)
         elif p.is_dir():
             for f in sorted(p.rglob("*")):
@@ -43,7 +48,7 @@ def collect(platform):
                     continue
                 if any(part in SKIP_DIRS for part in f.relative_to(ROOT).parts):
                     continue
-                if f.suffix in SKIP_SUFFIXES:
+                if f.suffix in skip_suffixes:
                     continue
                 files.append(f)
     # Зібрані бінарники agent_* (build/Release/*.exe на Windows, build/agent_* на Linux)
