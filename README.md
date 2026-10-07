@@ -2,7 +2,7 @@
 
 <p align="left">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License" height="20">
-  <img src="https://img.shields.io/badge/Platform-Windows-blue.svg?style=flat-square" alt="Platform" height="20">
+  <img src="https://img.shields.io/badge/Platform-Windows_%7C_Linux-blue.svg?style=flat-square" alt="Platform" height="20">
   <img src="https://img.shields.io/badge/scrcpy-compatible-brightgreen.svg?style=flat-square" alt="Scrcpy" height="20">
 </p>
 
@@ -96,7 +96,7 @@ sequenceDiagram
 
 ### Prerequisites
 
-- **Host OS**: Windows 10/11 (64-bit)
+- **Host OS**: Windows 10/11 (64-bit) or Linux (Debian/Ubuntu, Arch — see [6. Linux](#6-linux-debianubuntu-and-arch))
 - **Dependencies**:
   - `Python 3.8+`
   - `CMake 3.15+`
@@ -109,18 +109,25 @@ sequenceDiagram
 
 #### Option A: One-Click Auto Run (Recommended)
 
-Run via Windows script:
+Run via launcher script (window with the phone list opens first):
 
 ```cmd
 START.bat
 ```
 
-Window with the phone list opens first; closed it without a choice —
-the script continues automatically in the console.
+```bash
+./START.sh
+```
+
+Closed it without a choice — the script continues automatically in the console.
 Console-only mode (never opens a window):
 
 ```cmd
 START_CONSOLE.bat
+```
+
+```bash
+./START_CONSOLE.sh
 ```
 
 #### Option B: Advanced Command Line Interface
