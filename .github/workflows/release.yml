@@ -1,0 +1,83 @@
+name: release
+
+# Release for Windows + Linux. Trigger: push a version tag, e.g. v1.1.0
+#   git tag v1.1.0
+#   git push origin v1.1.0
+# The workflow builds C++ binaries on both OSes, packs them with the
+# Python tools / launchers / UI sources and publishes a GitHub Release
+# with two archives: scrcpy-wifi-module-win64.zip and
+# scrcpy-wifi-module-linux.tar.gz
+# (UI node_modules are NOT packed — installed on user machines via
+#  `cd ui && npm install`, the app offers it automatically.)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            archive: scrcpy-wifi-module-win64.zip
+          - os: ubuntu-24.04
+            platform: linux
+            archive: scrcpy-wifi-module-linux.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux build tools
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Configure (CMake)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (CMake)
+        run: cmake --build build --config Release
+
+      - name: Python syntax check
+        run: python -m py_compile tools/auto_run.py scripts/package_release.py run_simulation.py
+
+      - name: Package release archive
+        run: python scripts/package_release.py --platform ${{ matrix.platform }} --out dist/${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

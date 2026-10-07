@@ -229,6 +229,28 @@ Typical problems:
 > "virtual USB cable" feature. Plain screen mirroring via scrcpy over Wi-Fi
 > works **without them** (the program falls back to TCP mode by itself).
 
+### 6. Linux (Ubuntu/Debian)
+
+One-time setup (installs Python, adb, scrcpy, cmake, Node.js, vhci tools):
+
+```bash
+bash scripts/setup_linux.sh
+```
+
+Then use it exactly like on Windows:
+
+```bash
+./START.sh            # window first, like START.bat
+./START_CONSOLE.sh    # console only, like START_CONSOLE.bat
+./START_UI.sh         # standalone CyberDeck window
+./START.sh check      # diagnostics (adb/scrcpy/cmake/compiler/GUI block)
+```
+
+Missing pieces install themselves on request (`sudo apt-get install -y ...`).
+Notes: the C++ `agent_sender` builds with gcc via the same CMake project
+(`agent_receiver` is Windows-only — on Linux mirroring goes over scrcpy TCP,
+no Test Signing needed since VHCI is the in-kernel `vhci-hcd` module).
+
 ---
 
 ## 🛠️ Performance Tuning
@@ -248,12 +270,14 @@ scrcpy-wifi-module/
 ├── src/                # Core C/C++ engine, driver interop, and network stack
 ├── ui/                 # Status GUI, connection dialogs, and monitor widgets
 ├── tools/              # CLI runner, automation tools, and network utilities
-├── scripts/            # Build utilities and helper scripts
+├── scripts/            # Build utilities and helper scripts (setup_windows.ps1, setup_linux.sh, package_release.py)
+├── .github/workflows/  # Release CI: builds Windows + Linux archives on version tags
 ├── tests/              # Unit tests, mock daemons, and simulation suites
 ├── CMakeLists.txt      # Root CMake configuration
 ├── START.bat           # Launcher script for Windows (window first)
-├── START_CONSOLE.bat   # Console-only launcher (never opens a window)
-└── START_UI.bat        # Standalone CyberDeck Electron UI
+├── START.sh            # Launcher script for Linux (window first)
+├── START_CONSOLE.bat / START_CONSOLE.sh  # Console-only launchers
+└── START_UI.bat / START_UI.sh            # Standalone CyberDeck Electron UI
 ```
 
 ---

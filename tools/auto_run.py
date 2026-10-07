@@ -83,6 +83,31 @@ RECEIVER_NAMES = ["agent_receiver.exe", "agent_receiver"]
 DEFAULT_SENDER_PORT = 22777
 DEFAULT_ADB_PORT = 5555
 
+
+def _electron_bin_path(ui_dir):
+    """Шлях до бінарника Electron: electron.exe на Windows, electron на Linux/macOS."""
+    name = "electron.exe" if os.name == "nt" else "electron"
+    return ui_dir / "node_modules" / "electron" / "dist" / name
+
+
+def _count_electron_processes():
+    """Скільки процесів Electron вже запущено (детект дубль-вікна). 0 при невдачі."""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq electron.exe", "/FO", "CSV"],
+                               capture_output=True, text=True, timeout=10,
+                               encoding="utf-8", errors="replace")
+            return max(0, len([l for l in (r.stdout or "").splitlines()
+                               if "electron.exe" in l.lower()]))
+        if shutil.which("pgrep"):
+            r = subprocess.run(["pgrep", "-c", "-f", "[e]lectron"],
+                               capture_output=True, text=True, timeout=10,
+                               encoding="utf-8", errors="replace")
+            return max(0, int((r.stdout or "0").strip() or 0))
+    except Exception:
+        pass
+    return 0
+
 # За замовчуванням: НЕ ганяти TCP-скан портів по всій підмережі, а шукати тільки
 # живі IP (ping/arp). Порти підбираються точково на вибраному IP
 # (прощуп + перебір). Старий масовий скан портів вмикається прапорцем --port-scan.
@@ -669,7 +694,10 @@ def find_binary(names):
 def ensure_built(skip_build, dry_run, auto_yes=False, no_install=False):
     sender = find_binary(SENDER_NAMES)
     receiver = find_binary(RECEIVER_NAMES)
-    if sender and receiver:
+    # Receiver існує тільки на Windows (VHCI-драйвер); на Linux його відсутність —
+    # норма, там працюємо через scrcpy по TCP, перезбирати щоразу не треба.
+    need_receiver = (os.name == "nt")
+    if sender and (receiver or not need_receiver):
         log(f"Бінарники знайдено: sender={sender} receiver={receiver}")
         return sender, receiver
     if skip_build:
@@ -684,17 +712,21 @@ def ensure_built(skip_build, dry_run, auto_yes=False, no_install=False):
         # Тут повторно не ставимо мовчки — тільки підказка.
         log("ERROR: 'cmake' нема (ви відмовились від автовстановлення або воно не вдалося).")
         log("Варіант 1 (автоматом): запустіть з прапорцем --install-deps")
-        log("Варіант 2 (вручну): winget install Kitware.CMake")
-        log("Варіант 3 (все разом): powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1")
+        if os.name == "nt":
+            log("Варіант 2 (вручну): winget install Kitware.CMake")
+            log("Варіант 3 (все разом): powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1")
+        else:
+            log("Варіант 2 (вручну): sudo apt-get install -y cmake build-essential")
+            log("Варіант 3 (все разом): bash scripts/setup_linux.sh")
         return None, None
     if not check_compiler():
         if no_install:
-            log("ERROR: cmake є, але компілювати C++ нічим (MSVC не знайдено) — збірка неможлива.")
+            log("ERROR: cmake є, але компілювати C++ нічим — збірка неможлива.")
             return None, None
         # Важкий пакет — тільки з явної згоди (за замовчуванням default=Ні).
         offer_install_compiler(auto_yes=auto_yes)
         if not check_compiler():
-            log("ERROR: cmake є, але компілювати C++ нічим (MSVC не знайдено) — збірка неможлива.")
+            log("ERROR: cmake є, але компілювати C++ нічим — збірка неможлива.")
             return None, None
     rc, _ = run(["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"], timeout=180)
     if rc != 0:
@@ -2029,7 +2061,7 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             f"(шукав {ui_dir}). Запускайте з кореня репозиторію.")
         return None
 
-    electron_exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    electron_exe = _electron_bin_path(ui_dir)
     if not electron_exe.exists() and not (ui_dir / "node_modules").exists():
         log("Electron UI: нема ui/node_modules — CyberDeck без нього не стартує.")
         _npm_try = shutil.which("npm.cmd") or shutil.which("npm")
@@ -2092,12 +2124,10 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     # Дублікат вікна від минулого запуску = класична причина «порожнього списку»:
     # старе вікно (бекенд мертвий) перекриває нове. Попереджаємо одразу.
     try:
-        _r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq electron.exe", "/FO", "CSV"],
-                            capture_output=True, text=True, timeout=10,
-                            encoding="utf-8", errors="replace")
-        _n = max(0, len([l for l in (_r.stdout or "").splitlines() if "electron.exe" in l.lower()]))
+        _n = _count_electron_processes()
         if _n:
-            log(f"УВАГА: вже запущено electron.exe ({_n}). Якщо бачите порожнє вікно — "
+            _exe_name = "electron.exe" if os.name == "nt" else "electron"
+            log(f"УВАГА: вже запущено {_exe_name} ({_n}). Якщо бачите порожнє вікно — "
                 "закрийте ВСІ вікна програми і запустіть заново (старе вікно не оновлюється).")
     except Exception:
         pass
@@ -3646,6 +3676,25 @@ def decide_quality(args, adb_host, use_fake_adb):
 def check_vhci():
     """Чи є драйвер vhci (для --vhci)."""
     if os.name != "nt":
+        # Linux: VHCI — штатний модуль ядра vhci-hcd, Test Signing не потрібен.
+        try:
+            import glob as _glob
+            if _glob.glob("/dev/vhci*") or _glob.glob("/sys/bus/platform/drivers/vhci_hcd/*"):
+                log("VHCI (vhci-hcd) знайдено — віртуальний USB можливий.")
+                return True
+            r = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=10,
+                               encoding="utf-8", errors="replace")
+            if "vhci_hcd" in (r.stdout or ""):
+                log("VHCI (модуль vhci_hcd завантажено) — віртуальний USB можливий.")
+                return True
+        except Exception:
+            pass
+        if shutil.which("usbip"):
+            log("VHCI: модуль vhci-hcd не завантажено, але є утиліта usbip "
+                "(sudo modprobe vhci-hcd для віртуального USB).")
+        else:
+            log("VHCI: нема vhci-hcd/usbip — буде робота через scrcpy по TCP "
+                "(пакет linux-tools-generic дає usbip: sudo apt-get install -y linux-tools-generic).")
         return False
     for dev in (r"\\.\vhci", r"\\.\USBIP_VHCI"):
         try:
@@ -3671,9 +3720,46 @@ WINGET_PKGS = (
     ("scrcpy", "Genymobile.scrcpy"),
 )
 
+# Linux (Debian/Ubuntu): tool -> apt-пакет. adb дає android-tools-adb,
+# scrcpy є в universe починаючи з 22.04.
+APT_PKGS = (
+    ("cmake", "cmake"),
+    ("adb", "android-tools-adb"),
+    ("scrcpy", "scrcpy"),
+)
+
+
+def _os_pkgs():
+    """Таблиця (tool, pkg-id) під поточну ОС."""
+    return WINGET_PKGS if os.name == "nt" else APT_PKGS
+
+
+def install_linux_deps():
+    """Самому доустановити відсутнє через apt (Debian/Ubuntu)."""
+    if not shutil.which("apt-get"):
+        log("apt-get не знайдено — встановіть залежності вручну (див. README).")
+        return False
+    missing_pkgs = [pkg for tool, pkg in APT_PKGS if not shutil.which(tool)]
+    if not missing_pkgs:
+        return False
+    if os.geteuid() != 0 and not shutil.which("sudo"):
+        log("Потрібен root або sudo для apt-get — встановіть вручну: "
+            f"sudo apt-get install -y {' '.join(missing_pkgs)}")
+        return False
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    log(f"Довстановлюю САМ: apt-get install -y {' '.join(missing_pkgs)} ...")
+    rc, _ = run(prefix + ["apt-get", "update"], timeout=300)
+    if rc != 0:
+        log("apt-get update не вдався — далі пробую встановити як є.")
+    rc, _ = run(prefix + ["apt-get", "install", "-y"] + missing_pkgs, timeout=600)
+    return rc == 0
+
+
 def install_deps():
-    """Самому доустановити відсутнє через winget (швидкі пакети, без компілятора)."""
-    if os.name != "nt" or not shutil.which("winget"):
+    """Самому доустановити відсутнє: winget на Windows, apt на Linux."""
+    if os.name != "nt":
+        return install_linux_deps()
+    if not shutil.which("winget"):
         log("winget не знайдено — встановіть залежності вручну (див. README).")
         return False
     installed_any = False
@@ -3728,17 +3814,41 @@ def ask_yes_no(question, default_yes=True):
 
 
 def offer_install_missing_deps(missing, auto_yes=False):
-    """Запропонувати довстановити відсутнє через winget, спитавши підтвердження.
+    """Запропонувати довстановити відсутнє (winget/apt), спитавши підтвердження.
 
-    missing: список (tool, winget_id). auto_yes=True — встановити без питань
-    (режим --install-deps / --yes). Повертає True якщо встановлення виконано
-    (або спробовано), False якщо користувач відмовився / нема winget / неінтерактивно.
+    missing: список (tool, pkg-id під поточну ОС). auto_yes=True — встановити
+    без питань (режим --install-deps / --yes). Повертає True якщо встановлення
+    виконано (або спробовано), False якщо відмова/неможливо/неінтерактивно.
     """
     if not missing:
         return False
     names = ", ".join(t for t, _ in missing)
     log(f"Бракує: {names}.")
-    if os.name != "nt" or not shutil.which("winget"):
+    if os.name != "nt":
+        if not shutil.which("apt-get"):
+            log("Автовстановлення можливе через apt-get (Debian/Ubuntu).")
+            for tool, pkg in missing:
+                log(f"  Вручну: sudo apt-get install -y {pkg}")
+            return False
+        if auto_yes:
+            log("Автовстановлення увімкнено прапорцем — ставлю без питань...")
+            install_linux_deps()
+            return True
+        if not _stdin_interactive():
+            log("Неінтерактивний режим — пропускаю автовстановлення.")
+            for tool, pkg in missing:
+                log(f"  Вручну: sudo apt-get install -y {pkg}  (або запустіть з --install-deps)")
+            return False
+        log(f"Можу довстановити САМ через apt-get ({names}, знадобиться sudo).")
+        if ask_yes_no("Встановити відсутнє автоматично?", default_yes=True):
+            log("Ок, встановлюю...")
+            install_linux_deps()
+            return True
+        log("Ок, пропускаю автовстановлення. Продовжую з тим що є.")
+        for tool, pkg in missing:
+            log(f"  Коли буде час: sudo apt-get install -y {pkg}  (або ./START.sh install)")
+        return False
+    if not shutil.which("winget"):
         log("Автовстановлення можливе тільки на Windows з winget.")
         for tool, pkg in missing:
             log(f"  Вручну: winget install {pkg}")
@@ -3763,7 +3873,15 @@ def offer_install_missing_deps(missing, auto_yes=False):
     return False
 
 def check_compiler():
-    """Чи є чим компілювати C++ (MSVC). Повертає True якщо компілятор знайдено."""
+    """Чи є чим компілювати C++ (MSVC на Windows, gcc/clang на Linux)."""
+    if os.name != "nt":
+        for cc in ("gcc", "clang", "cc"):
+            if shutil.which(cc):
+                log(f"  compiler ({cc}): OK")
+                return True
+        log("  compiler: НЕМА — для збірки C++ потрібен компілятор.")
+        log("    sudo apt-get install -y build-essential cmake")
+        return False
     if shutil.which("cl") or shutil.which("msbuild"):
         log("  compiler (MSVC): OK")
         return True
@@ -3794,12 +3912,16 @@ def check_gui():
         import tkinter  # noqa: F401
         log("  tkinter: OK (стандартне вікно працюватиме)")
     except ImportError:
-        log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
-            "Перевстановіть Python з https://www.python.org/downloads/ "
-            "(лишіть опцію 'tcl/tk and IDLE').")
+        if os.name == "nt":
+            log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
+                "Перевстановіть Python з https://www.python.org/downloads/ "
+                "(лишіть опцію 'tcl/tk and IDLE').")
+        else:
+            log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
+                "Встановіть: sudo apt-get install -y python3-tk")
     ui_dir = ROOT / "ui"
     log(f"  ui/package.json: {'OK' if (ui_dir / 'package.json').exists() else 'НЕМА (запуск не з кореня репозиторію?)'}")
-    _exe = ui_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    _exe = _electron_bin_path(ui_dir)
     if _exe.exists():
         log("  electron: OK (CyberDeck вікно працюватиме)")
     else:
@@ -3813,11 +3935,37 @@ def check_gui():
 
 
 def offer_install_compiler(auto_yes=False):
-    """Запропонувати встановити MSVC Build Tools (важкий пакет!) з підтвердженням.
+    """Запропонувати встановити компілятор C++ з підтвердженням.
 
+    Windows: MSVC Build Tools (важкий пакет!). Linux: build-essential через apt.
     Повертає True якщо встановлення спробовано, False якщо відмова/неможливо.
     """
-    if os.name != "nt" or not shutil.which("winget"):
+    if os.name != "nt":
+        if check_compiler():
+            return False
+        if not shutil.which("apt-get"):
+            log("Встановіть компілятор вручну (див. README).")
+            return False
+        do_it = bool(auto_yes)
+        if not do_it:
+            if not _stdin_interactive():
+                log("Неінтерактивний режим — компілятор не ставлю (запустіть з --install-deps щоб ставити без питань).")
+                return False
+            do_it = ask_yes_no("Встановити build-essential зараз (sudo apt-get, ~200 МБ)?", default_yes=True)
+        if not do_it:
+            log("Ок, без компілятора збірка C++ неможлива — продовжую без неї (fallback через scrcpy по TCP).")
+            return False
+        prefix = [] if os.geteuid() == 0 else ["sudo"]
+        if not shutil.which("sudo") and os.geteuid() != 0:
+            log("Нема sudo і не root — встановіть вручну: sudo apt-get install -y build-essential")
+            return False
+        run(prefix + ["apt-get", "install", "-y", "build-essential"], timeout=600)
+        if check_compiler():
+            log("Компілятор з'явився — продовжую збірку.")
+            return True
+        log("Компілятор так і не знайдено.")
+        return True
+    if not shutil.which("winget"):
         log("Автовстановлення компілятора можливе тільки на Windows з winget.")
         return False
     if check_compiler():
@@ -3996,12 +4144,17 @@ def main():
     has_scrcpy = shutil.which("scrcpy") is not None
     has_cmake = shutil.which("cmake") is not None
     has_py = True
-    log(f"  adb: {'OK' if has_adb else 'НЕМА (winget install Google.PlatformTools або --install-deps)'}")
-    log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (winget install Genymobile.scrcpy або --install-deps)'}")
-    log(f"  cmake: {'OK' if has_cmake else 'НЕМА (winget install Kitware.CMake або --install-deps)'}")
+    if os.name == "nt":
+        log(f"  adb: {'OK' if has_adb else 'НЕМА (winget install Google.PlatformTools або --install-deps)'}")
+        log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (winget install Genymobile.scrcpy або --install-deps)'}")
+        log(f"  cmake: {'OK' if has_cmake else 'НЕМА (winget install Kitware.CMake або --install-deps)'}")
+    else:
+        log(f"  adb: {'OK' if has_adb else 'НЕМА (sudo apt-get install -y android-tools-adb або --install-deps)'}")
+        log(f"  scrcpy: {'OK' if has_scrcpy else 'НЕМА (sudo apt-get install -y scrcpy або --install-deps)'}")
+        log(f"  cmake: {'OK' if has_cmake else 'НЕМА (sudo apt-get install -y cmake build-essential або --install-deps)'}")
     log(f"  python: OK ({sys.version.split()[0]})")
     if (not has_adb or not has_scrcpy or not has_cmake) and not args.dry_run and not no_install:
-        missing = [(t, p) for t, p in WINGET_PKGS if not shutil.which(t)]
+        missing = [(t, p) for t, p in _os_pkgs() if not shutil.which(t)]
         if missing:
             offer_install_missing_deps(missing, auto_yes=auto_yes)
             # перечитати після можливого встановлення
@@ -4104,8 +4257,11 @@ def main():
             log(f"  scrcpy -s {tcp_serial}")
             log("Це звичайний TCP-режим scrcpy (НЕ віртуальний USB).")
             log("Для повного модуля (віртуальний USB) добудуйте toolchain:")
-            log("  winget install Kitware.CMake  (або START.bat install)")
-            log("  + MSVC Build Tools з C++ (команда була в --check)")
+            if os.name == "nt":
+                log("  winget install Kitware.CMake  (або START.bat install)")
+                log("  + MSVC Build Tools з C++ (команда була в --check)")
+            else:
+                log("  sudo apt-get install -y cmake build-essential  (або ./START.sh install)")
             log("Потім перезапустіть START.bat — підхопить телефон сам (IP запам'ятав).")
             log("======================================================")
             log("")
@@ -4128,11 +4284,14 @@ def main():
                     pass
             return 0
         log("ERROR: бінарників нема і зібрати не вдалося.")
-        log("Варіанти: START.bat install (cmake сам) + MSVC Build Tools, або --skip-build якщо бінарники десь інде.")
+        if os.name == "nt":
+            log("Варіанти: START.bat install (cmake сам) + MSVC Build Tools, або --skip-build якщо бінарники десь інде.")
+        else:
+            log("Варіанти: ./START.sh install (cmake сам) + build-essential, або --skip-build якщо бінарники десь інде.")
         return 1
 
     # VHCI?
-    vhci_ok = check_vhci() if os.name == "nt" else False
+    vhci_ok = check_vhci()
     use_vhci = bool(args.with_vhci and vhci_ok)
     if args.with_vhci and not vhci_ok:
         log("--with-vhci запитано, але драйвера нема — продовжую в SIMULATION.")
@@ -4193,7 +4352,10 @@ def main():
     scrcpy_proc = None
     if not args.no_scrcpy:
         if not has_scrcpy:
-            log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: winget install Genymobile.scrcpy")
+            if os.name == "nt":
+                log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: winget install Genymobile.scrcpy")
+            else:
+                log("Крок 7: scrcpy НЕМА — пропускаю автозапуск. Встановіть: sudo apt-get install -y scrcpy")
         else:
             log(f"Крок 7: запускаю scrcpy САМ: {' '.join(scrcpy_cmd)} ...")
             try:

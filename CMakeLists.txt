@@ -24,18 +24,18 @@ add_library(common STATIC
 target_include_directories(common PUBLIC src/common)
 target_compile_features(common PUBLIC cxx_std_17)
 
-# Agent-Receiver (Windows Host)
+# Agent-Receiver (Windows Host only: uses setupapi/WinUSB/VHCI driver API).
+# On Linux the same role is played by the kernel vhci-hcd + usbip tools,
+# so this target is skipped there (sender + scrcpy-over-TCP still work).
+if(WIN32)
 add_executable(agent_receiver
     src/agent_receiver/receiver_main.cpp
     src/agent_receiver/vhci_injector.cpp
     src/agent_receiver/adb_spoof.cpp
     src/agent_receiver/ghost_device.cpp
 )
-target_link_libraries(agent_receiver PRIVATE common)
+target_link_libraries(agent_receiver PRIVATE common ws2_32 setupapi)
 target_include_directories(agent_receiver PRIVATE src/common)
-
-if(WIN32)
-    target_link_libraries(agent_receiver PRIVATE ws2_32 setupapi)
     # Для msquic (QUIC) — розкоментувати коли буде встановлено msquic
     # find_package(msquic CONFIG REQUIRED)
     # target_link_libraries(agent_receiver PRIVATE msquic)
@@ -59,8 +59,9 @@ endif()
 # Android NDK — фейковий таргет для перевірки крос-компіляції
 # Збірка для Android: cmake -B build-android -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
 
-# Тести
-if(BUILD_TESTS)
+# Тести (тільки якщо каталог tests/ існує — інакше мовчки пропускаємо,
+# щоб свіжий клон/архів без тестів не ламав configure).
+if(BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fec.cpp")
     enable_testing()
 
     add_executable(test_fec tests/test_fec.cpp)
