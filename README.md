@@ -141,92 +141,93 @@ python tools/auto_run.py --mode demo
 
 ---
 
-## ⬇️ Завантаження та користування
+## ⬇️ Download & Usage
 
-### 1. Завантаження
+### 1. Download
 
-Варіант 1 — через git:
+Option 1 — via git:
 
 ```cmd
-git clone <посилання-на-репозиторій>
+git clone <repository-url>
 cd scrcpy-wifi-moduel
 ```
 
-Варіант 2 — без git: на сторінці репозиторію натисніть
-**Code → Download ZIP**, розпакуйте архів у будь-яку папку.
+Option 2 — no git: on the repository page click
+**Code → Download ZIP** and unpack the archive into any folder.
 
-### 2. Що встановити
+### 2. What to install
 
-| Програма | Навіщо | Як встановити |
+| Program | Why | How to install |
 |---|---|---|
-| Python 3.10+ | Запуск `START.bat` | З [python.org](https://www.python.org/downloads/): під час встановлення лишіть галочки **Add python.exe to PATH** і **tcl/tk and IDLE** (без другої не буде запасного вікна) |
-| Node.js LTS | Вікно CyberDeck (Electron UI) | З [nodejs.org](https://nodejs.org/) |
-| adb, scrcpy, cmake | Підключення телефона і картинка | Ставляться **самі**: `START.bat install` (через winget), або вручну: `winget install Google.PlatformTools`, `winget install Genymobile.scrcpy`, `winget install Kitware.CMake` |
+| Python 3.10+ | Runs `START.bat` | From [python.org](https://www.python.org/downloads/): during setup keep **Add python.exe to PATH** and **tcl/tk and IDLE** checked (without the second one the fallback window won't work) |
+| Node.js LTS | CyberDeck window (Electron UI) | From [nodejs.org](https://nodejs.org/) |
+| adb, scrcpy, cmake | Phone connection and screen | Installed **automatically**: `START.bat install` (via winget), or manually: `winget install Google.PlatformTools`, `winget install Genymobile.scrcpy`, `winget install Kitware.CMake` |
 
-Для вікна CyberDeck один раз встановіть його залежності
-(програма і сама це запропонує при першому запуску, але можна вручну):
+For the CyberDeck window, install its dependencies once
+(the program offers to do it on first launch, or do it manually):
 
 ```cmd
 cd ui
 npm install
 ```
 
-### 3. Перший запуск (новий телефон)
+### 3. First run (new phone)
 
-1. Телефон і ПК мають бути **в одній Wi-Fi мережі**.
-2. На телефоні увімкніть: **Параметри → Для розробників → Бездротове налагодження**.
-3. Запустіть подвійним кліком:
+1. The phone and the PC must be on the **same Wi-Fi network**.
+2. On the phone enable: **Settings → Developer options → Wireless debugging**.
+3. Launch with a double-click:
    ```cmd
    START.bat
    ```
-4. Відкриється **вікно зі списком телефонів** — клікніть по своєму.
-5. Якщо телефон ще не спаровано, вікно попросить **6-значний код з екрану**
-   (на телефоні: «Pair device with pairing code»). Код одноразовий.
-6. Після підключення автоматично відкриється вікно scrcpy з картинкою.
+4. A **window with the phone list** opens — click yours.
+5. If the phone is not paired yet, the window asks for the **6-digit code
+   from its screen** (on the phone: "Pair device with pairing code").
+   The code is one-time use.
+6. After connecting, the scrcpy window with the picture opens automatically.
 
-### 4. Щоденне користування
+### 4. Everyday use
 
 ```cmd
 START.bat
 ```
 
-Вікно зі списком з'являється **при кожному запуску**, навіть якщо програма
-пам'ятає минуле підключення: хочете той самий телефон — клікніть по ньому,
-хочете інший — клікніть по іншому. Закрили вікно без вибору — програма сама
-перепідключиться до останнього відомого пристрою і продовжить у консолі.
+The list window appears **on every launch**, even if the program remembers
+the last connection: want the same phone — click it, want another one —
+click that one. Closed the window without a choice — the program
+reconnects to the last known device by itself and continues in the console.
 
-Корисні варіанти:
+Handy variants:
 
 ```cmd
-START.bat --scan                  :: примусово показати ВСІ пристрої в мережі
-START.bat --phone-ip 192.168.0.XX :: підключитись напряму за IP (IP видно в телефоні:
-                                     Налаштування → Про телефон → Статус)
-START_CONSOLE.bat                 :: тільки консоль, вікно ніколи не відкривається
+START.bat --scan                  :: force-show ALL devices on the network
+START.bat --phone-ip 192.168.0.XX :: connect directly by IP (find it on the phone:
+                                     Settings → About phone → Status)
+START_CONSOLE.bat                 :: console only, never opens a window
 ```
 
-### 5. Діагностика
+### 5. Diagnostics
 
 ```cmd
 START.bat check
 ```
 
-Покаже що є/чого бракує: `adb`, `scrcpy`, `cmake`, компілятор C++ і блок
-**вікна (GUI)** — `tkinter`, `electron`, `node`, `npm`.
+Shows what is present/missing: `adb`, `scrcpy`, `cmake`, the C++ compiler,
+and the **windows (GUI)** block — `tkinter`, `electron`, `node`, `npm`.
 
-Типові проблеми:
+Typical problems:
 
-- **Вікна нема, тільки консоль** — дивіться рядок `Вікно пропущено: ...`
-  у консолі, там написана точна причина. Найчастіше: в Python нема tkinter
-  (перевстановіть Python з python.org з опцією `tcl/tk and IDLE`).
-- **CyberDeck не стартує** — виконайте `cd ui` → `npm install`
-  (потрібен Node.js LTS). Без нього працює запасне вікно tkinter.
-- **Телефон не знаходиться** — перевірте що ПК і телефон в одній Wi-Fi мережі
-  і що на телефоні увімкнено «Бездротове налагодження» (Android 11+).
-  Також допомагає `START.bat --scan`.
+- **No window, console only** — look for the `Window skipped: ...`
+  line in the console, it states the exact reason. Most common: this Python
+  has no tkinter (reinstall Python from python.org with `tcl/tk and IDLE`).
+- **CyberDeck won't start** — run `cd ui` → `npm install`
+  (requires Node.js LTS). Without it the fallback tkinter window is used.
+- **Phone not found** — make sure the PC and the phone share one Wi-Fi
+  network and "Wireless debugging" is on (Android 11+).
+  `START.bat --scan` also helps.
 
-> **Про компілятор C++ (MSVC) і драйвер VHCI**: потрібні тільки для фічі
-> «віртуальний USB-кабель». Звичайне дзеркалення екрану через scrcpy по Wi-Fi
-> працює **без них** (програма сама переходить у TCP-режим).
+> **About the C++ compiler (MSVC) and the VHCI driver**: only needed for the
+> "virtual USB cable" feature. Plain screen mirroring via scrcpy over Wi-Fi
+> works **without them** (the program falls back to TCP mode by itself).
 
 ---
 
