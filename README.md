@@ -229,25 +229,52 @@ Typical problems:
 > "virtual USB cable" feature. Plain screen mirroring via scrcpy over Wi-Fi
 > works **without them** (the program falls back to TCP mode by itself).
 
-### 6. Linux (Ubuntu/Debian)
+### 6. Linux (Debian/Ubuntu and Arch)
 
-One-time setup (installs Python, adb, scrcpy, cmake, Node.js, vhci tools):
+Download — via git:
+
+```bash
+git clone <repository-url>
+cd scrcpy-wifi-moduel
+```
+
+or without git: **Code → Download ZIP** on the repository page, unpack it,
+then make the launchers executable (zip archives lose the `+x` bit):
+
+```bash
+chmod +x START.sh START_CONSOLE.sh START_UI.sh
+```
+
+One-time setup (installs Python, adb, scrcpy, cmake, C++ compiler,
+Node.js, vhci tools — via `apt` on Debian/Ubuntu, via `pacman` on Arch):
 
 ```bash
 bash scripts/setup_linux.sh
 ```
 
-Then use it exactly like on Windows:
+First run: enable **Settings → Developer options → Wireless debugging**
+on the phone (same Wi-Fi as the PC), then:
 
 ```bash
-./START.sh            # window first, like START.bat
-./START_CONSOLE.sh    # console only, like START_CONSOLE.bat
-./START_UI.sh         # standalone CyberDeck window
-./START.sh check      # diagnostics (adb/scrcpy/cmake/compiler/GUI block)
+./START.sh            # window with the phone list opens first
 ```
 
-Missing pieces install themselves on request (`sudo apt-get install -y ...`
-on Debian/Ubuntu, `sudo pacman -S --needed ...` on Arch).
+Click your phone in the window; if it is not paired yet, enter the 6-digit
+code from its screen ("Pair device with pairing code"). The scrcpy window
+opens automatically after connecting.
+
+Everyday use and extras (same as Windows):
+
+```bash
+./START.sh            # list window on every launch, even for known devices
+./START.sh --scan     # force-show ALL devices on the network
+./START.sh --phone-ip 192.168.0.XX  # connect directly by IP
+./START_CONSOLE.sh    # console only, never opens a window
+./START_UI.sh         # standalone CyberDeck window
+./START.sh check      # diagnostics (adb/scrcpy/cmake/compiler/GUI block)
+./START.sh install    # install missing pieces (adb/scrcpy) on request
+```
+
 Notes: the C++ `agent_sender` builds with gcc via the same CMake project
 (`agent_receiver` is Windows-only — on Linux mirroring goes over scrcpy TCP,
 no Test Signing needed since VHCI is the in-kernel `vhci-hcd` module).
