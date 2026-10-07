@@ -101,6 +101,7 @@ sequenceDiagram
   - `Python 3.8+`
   - `CMake 3.15+`
   - `scrcpy` and `adb` available in system `PATH`
+  - `Node.js LTS` (optional, only for the CyberDeck Electron window)
 
 ---
 
@@ -140,6 +141,95 @@ python tools/auto_run.py --mode demo
 
 ---
 
+## ⬇️ Завантаження та користування
+
+### 1. Завантаження
+
+Варіант 1 — через git:
+
+```cmd
+git clone <посилання-на-репозиторій>
+cd scrcpy-wifi-moduel
+```
+
+Варіант 2 — без git: на сторінці репозиторію натисніть
+**Code → Download ZIP**, розпакуйте архів у будь-яку папку.
+
+### 2. Що встановити
+
+| Програма | Навіщо | Як встановити |
+|---|---|---|
+| Python 3.10+ | Запуск `START.bat` | З [python.org](https://www.python.org/downloads/): під час встановлення лишіть галочки **Add python.exe to PATH** і **tcl/tk and IDLE** (без другої не буде запасного вікна) |
+| Node.js LTS | Вікно CyberDeck (Electron UI) | З [nodejs.org](https://nodejs.org/) |
+| adb, scrcpy, cmake | Підключення телефона і картинка | Ставляться **самі**: `START.bat install` (через winget), або вручну: `winget install Google.PlatformTools`, `winget install Genymobile.scrcpy`, `winget install Kitware.CMake` |
+
+Для вікна CyberDeck один раз встановіть його залежності
+(програма і сама це запропонує при першому запуску, але можна вручну):
+
+```cmd
+cd ui
+npm install
+```
+
+### 3. Перший запуск (новий телефон)
+
+1. Телефон і ПК мають бути **в одній Wi-Fi мережі**.
+2. На телефоні увімкніть: **Параметри → Для розробників → Бездротове налагодження**.
+3. Запустіть подвійним кліком:
+   ```cmd
+   START.bat
+   ```
+4. Відкриється **вікно зі списком телефонів** — клікніть по своєму.
+5. Якщо телефон ще не спаровано, вікно попросить **6-значний код з екрану**
+   (на телефоні: «Pair device with pairing code»). Код одноразовий.
+6. Після підключення автоматично відкриється вікно scrcpy з картинкою.
+
+### 4. Щоденне користування
+
+```cmd
+START.bat
+```
+
+Вікно зі списком з'являється **при кожному запуску**, навіть якщо програма
+пам'ятає минуле підключення: хочете той самий телефон — клікніть по ньому,
+хочете інший — клікніть по іншому. Закрили вікно без вибору — програма сама
+перепідключиться до останнього відомого пристрою і продовжить у консолі.
+
+Корисні варіанти:
+
+```cmd
+START.bat --scan                  :: примусово показати ВСІ пристрої в мережі
+START.bat --phone-ip 192.168.0.XX :: підключитись напряму за IP (IP видно в телефоні:
+                                     Налаштування → Про телефон → Статус)
+START_CONSOLE.bat                 :: тільки консоль, вікно ніколи не відкривається
+```
+
+### 5. Діагностика
+
+```cmd
+START.bat check
+```
+
+Покаже що є/чого бракує: `adb`, `scrcpy`, `cmake`, компілятор C++ і блок
+**вікна (GUI)** — `tkinter`, `electron`, `node`, `npm`.
+
+Типові проблеми:
+
+- **Вікна нема, тільки консоль** — дивіться рядок `Вікно пропущено: ...`
+  у консолі, там написана точна причина. Найчастіше: в Python нема tkinter
+  (перевстановіть Python з python.org з опцією `tcl/tk and IDLE`).
+- **CyberDeck не стартує** — виконайте `cd ui` → `npm install`
+  (потрібен Node.js LTS). Без нього працює запасне вікно tkinter.
+- **Телефон не знаходиться** — перевірте що ПК і телефон в одній Wi-Fi мережі
+  і що на телефоні увімкнено «Бездротове налагодження» (Android 11+).
+  Також допомагає `START.bat --scan`.
+
+> **Про компілятор C++ (MSVC) і драйвер VHCI**: потрібні тільки для фічі
+> «віртуальний USB-кабель». Звичайне дзеркалення екрану через scrcpy по Wi-Fi
+> працює **без них** (програма сама переходить у TCP-режим).
+
+---
+
 ## 🛠️ Performance Tuning
 
 For minimum latency and high-framerate performance:
@@ -160,7 +250,9 @@ scrcpy-wifi-module/
 ├── scripts/            # Build utilities and helper scripts
 ├── tests/              # Unit tests, mock daemons, and simulation suites
 ├── CMakeLists.txt      # Root CMake configuration
-└── START.bat           # Launcher script for Windows
+├── START.bat           # Launcher script for Windows (window first)
+├── START_CONSOLE.bat   # Console-only launcher (never opens a window)
+└── START_UI.bat        # Standalone CyberDeck Electron UI
 ```
 
 ---
