@@ -3,6 +3,32 @@ const path = require('path');
 const net = require('net');
 const PythonBridge = require('./python-bridge');
 
+// --- Linux fixes: root sandbox + Wayland/GPU ---
+// Electron на Linux падає мовчки в 3 типових випадках:
+//  1) запуск від root без --no-sandbox ("Running as root without --no-sandbox is not supported");
+//  2) Wayland-сесія без ozone-hint (порожнє/чорне вікно);
+//  3) битий GPU-стек (VM, старі драйвери) — лікується --disable-gpu.
+function isRoot() {
+  try {
+    return typeof process.getuid === 'function' && process.getuid() === 0;
+  } catch (e) {
+    return false;
+  }
+}
+if (process.platform === 'linux') {
+  if (isRoot() || process.argv.includes('--no-sandbox')) {
+    app.commandLine.appendSwitch('no-sandbox');
+  }
+  // Wayland: нехай Chromium сам вибере бекенд (x11/wayland).
+  if (!process.argv.includes('--ozone-platform-hint') && !process.argv.includes('--ozone-platform')) {
+    app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+  }
+  // Опціонально: ELECTRON_DISABLE_GPU=1 ./START_UI.sh — для VM/старих GPU.
+  if (process.env.ELECTRON_DISABLE_GPU === '1' || process.argv.includes('--disable-gpu')) {
+    app.disableHardwareAcceleration();
+  }
+}
+
 let mainWindow;
 let bridge = null;
 const isParentPython = process.argv.includes('--parent-python');

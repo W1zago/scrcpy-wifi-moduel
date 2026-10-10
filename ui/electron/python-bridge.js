@@ -21,7 +21,33 @@ class PythonBridge extends EventEmitter {
     if (process.argv.includes('--ip-only')) {
       extraArgs.push('--ip-only');
     }
-    this.process = spawn('python', [
+    // Linux/macOS: бінарник зветься python3, 'python' часто відсутній
+    // (Debian/Ubuntu). На Windows — 'python' / 'py'.
+    const pyCmd =
+      process.env.PYTHON_BIN ||
+      (process.platform === 'win32' ? 'python' : 'python3');
+    const pyFallback =
+      process.platform === 'win32' ? 'py' : 'python';
+    this._spawnPython(pyCmd, pyFallback, scriptPath, extraArgs);
+  }
+
+  _spawnPython(pyCmd, pyFallback, scriptPath, extraArgs) {
+    let cmd = pyCmd;
+    // Якщо python3 нема в PATH — пробуємо fallback (python / py).
+    try {
+      const { spawnSync } = require('child_process');
+      const check = spawnSync(cmd, ['--version'], { stdio: 'ignore', timeout: 5000 });
+      if (check.error || check.status !== 0) {
+        const fb = spawnSync(pyFallback, ['--version'], { stdio: 'ignore', timeout: 5000 });
+        if (!fb.error && fb.status === 0) {
+          console.log(`[PythonBridge] '${cmd}' недоступний, використовую '${pyFallback}'`);
+          cmd = pyFallback;
+        }
+      }
+    } catch (e) {
+      // ігноруємо — спробуємо запустити як є, помилку буде видно в 'error'
+    }
+    this.process = spawn(cmd, [
       scriptPath,
       '--electron-mode',
       '--no-gui',
@@ -35,6 +61,20 @@ class PythonBridge extends EventEmitter {
         PYTHONUNBUFFERED: '1'
       }
     });
+    this.process.on('error', (err) => {
+      // Типово Linux: ENOENT коли нема 'python' (є тільки 'python3') і навпаки.
+      console.error(`[PythonBridge] не вдалося запустити '${cmd}': ${err.message}`);
+      if (cmd !== pyFallback) {
+        console.log(`[PythonBridge] пробую fallback '${pyFallback}'...`);
+        this._spawnPython(pyFallback, pyFallback, scriptPath, extraArgs);
+        return;
+      }
+      this.emit('python-error', `Python не знайдено ('${cmd}'): ${err.message}`);
+    });
+    if (!this.process.stdout || !this.process.stderr) {
+      // spawn не вдався (ENOENT) — fallback вже запущено вище, слухачі не потрібні
+      return;
+    }
 
     this.process.stdout.on('data', (data) => {
       this.buffer += data.toString();

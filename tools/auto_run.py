@@ -2026,8 +2026,37 @@ def _wireless_pair_then_connect(pair_dev, pair_code, mdns_timeout=2.5):
 def _gui_usable():
     try:
         import tkinter  # noqa: F401
-        return True
     except ImportError:
+        return False
+    # Linux без X11/Wayland: Tk() впаде з "no display name" — вважаємо GUI недоступним
+    # одразу, щоб показати зрозумілу підказку, а не мовчки йти в консоль.
+    if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    return True
+
+
+def _display_missing_reason():
+    """Людяне пояснення чому вікна не буде (тільки для логів на Linux)."""
+    if os.name == "nt":
+        return ""
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"):
+            return ("нема DISPLAY/WAYLAND_DISPLAY (SSH без X-forwarding). "
+                    "Для вікна: ssh -X user@host, або запускайте локально. "
+                    "Без вікна: ./START_CONSOLE.sh або --no-gui.")
+        return ("нема DISPLAY/WAYLAND_DISPLAY (нема графічної сесії). "
+                "Запускайте з графічного термінала, не з чистого TTY/docker без -e DISPLAY. "
+                "Без вікна: ./START_CONSOLE.sh або --no-gui.")
+    return ""
+
+
+def _needs_no_sandbox():
+    """Чи треба запускати Electron з --no-sandbox (root на Linux)."""
+    if os.name == "nt":
+        return False
+    try:
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+    except Exception:
         return False
 
 
@@ -2054,6 +2083,11 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     from pathlib import Path
 
     _extra_scan_ports = [int(p) for p in (scan_ports or []) if str(p).isdigit()]
+
+    # Linux без графічної сесії: Electron впаде мовчки — не пробуємо, одразу tkinter-fallback.
+    if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        log("Electron UI пропущено: " + _display_missing_reason())
+        return None
 
     ui_dir = ROOT / "ui"
     if not (ui_dir / "package.json").exists():
@@ -2089,6 +2123,10 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                 "Поки що пробую запустити через npm...")
     if electron_exe.exists():
         cmd = [str(electron_exe), str(ui_dir), "--parent-python"]
+        # Root на Linux: Chromium відмовляється без --no-sandbox, main.js теж додає
+        # прапорець, але передаємо явно для надійності (старий білд main.js).
+        if _needs_no_sandbox() and "--no-sandbox" not in cmd:
+            cmd = [cmd[0], "--no-sandbox"] + cmd[1:]
     else:
         npm_bin = shutil.which("npm.cmd") or shutil.which("npm") or shutil.which("npx.cmd") or shutil.which("npx")
         if not npm_bin:
@@ -2097,6 +2135,9 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                 "Переходжу на стандартне вікно...")
             return None
         cmd = [npm_bin, "--prefix", str(ui_dir), "start", "--", "--parent-python"]
+        if _needs_no_sandbox():
+            # npm start -- <args> прокидаються в electron, chromium їх розбере
+            cmd = cmd + ["--no-sandbox"]
         if os.name == "nt" and str(npm_bin).lower().endswith((".cmd", ".bat")):
             # .cmd/.bat не запускаються напряму через CreateProcess —
             # виконуємо через cmd /c, інакше вікно мовчки не стартує.
@@ -2529,9 +2570,25 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
         log(f"Electron не зміг стартувати (код {rc}) — переходжу на стандартне вікно...")
         if err_tail:
             log(f"Причина з stderr: {err_tail[:1500]}")
+            low = err_tail.lower()
+            if "no-sandbox" in low or ("root" in low and "sandbox" in low):
+                log("Це запуск від root: перезапустіть НЕ від root, або Electron сам додасть "
+                    "--no-sandbox (оновіть код: ui/electron/main.js). Тимчасово: "
+                    "запускайте electron з --no-sandbox вручну.")
+            elif "libnss" in low or "libatk" in low or "cannot open shared object" in low \
+                    or "error while loading shared libraries" in low:
+                log("Не вистачає системних бібліотек Electron. Встановіть: "
+                    f"{_manual_install_cmd('libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2')} "
+                    "або запустіть: bash scripts/setup_linux.sh")
+            elif "no display" in low or "missing x server" in low or "cannot open display" in low:
+                log("Нема дисплея: " + _display_missing_reason())
+            elif "gpu" in low:
+                log("Схоже на падіння GPU-стека (VM/старі драйвери): спробуйте "
+                    "ELECTRON_DISABLE_GPU=1 ./START.sh")
         else:
             log("Підказка: найчастіше це нема ui/node_modules — виконайте: cd ui && npm install. "
-                "Або подивіться повний лог вище ([UI]/[UI-ERR]).")
+                "Або подивіться повний лог вище ([UI]/[UI-ERR]). "
+                "Діагностика: ./START.sh check")
         return None
 
     def _drain_stderr():
@@ -2597,6 +2654,9 @@ def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     import tkinter as tk
     from tkinter import ttk
 
+    if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise RuntimeError(_display_missing_reason() or "нема дисплея (DISPLAY/WAYLAND_DISPLAY)")
+
     _extra_scan_ports = [int(p) for p in (scan_ports or []) if str(p).isdigit()]
 
     result = {"ip": "", "port": 0, "ok": False}
@@ -2605,7 +2665,14 @@ def _tkinter_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
     dev_lock = threading.Lock()
     q = queue.Queue()
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        # Типово Linux: _tkinter.TclError: couldn't connect to display / no display name
+        msg = str(e)
+        if "display" in msg.lower() or "couldn't connect" in msg.lower():
+            raise RuntimeError(f"{_display_missing_reason()} (tkinter: {msg})")
+        raise
     root.title("Virtual USB Cable — підключення телефону")
     root.geometry("600x560")
     root.minsize(520, 480)
@@ -3952,7 +4019,11 @@ def check_gui():
     log("  --- вікна (GUI) ---")
     try:
         import tkinter  # noqa: F401
-        log("  tkinter: OK (стандартне вікно працюватиме)")
+        if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            log("  tkinter: встановлено, але НЕМА DISPLAY/WAYLAND_DISPLAY — вікна не буде.")
+            log(f"  причина: {_display_missing_reason()}")
+        else:
+            log("  tkinter: OK (стандартне вікно працюватиме)")
     except ImportError:
         if os.name == "nt":
             log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
@@ -3961,6 +4032,18 @@ def check_gui():
         else:
             log("  tkinter: НЕМА — вікна не буде, тільки консоль. "
                 f"Встановіть: {_manual_install_cmd('python3-tk')}")
+    if os.name != "nt":
+        _disp = os.environ.get("DISPLAY", "")
+        _way = os.environ.get("WAYLAND_DISPLAY", "")
+        _sess = os.environ.get("XDG_SESSION_TYPE", "")
+        log(f"  display: DISPLAY={_disp or '-'} WAYLAND_DISPLAY={_way or '-'} XDG_SESSION_TYPE={_sess or '-'}")
+        try:
+            _is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        except Exception:
+            _is_root = False
+        if _is_root:
+            log("  sandbox: запуск від ROOT — Electron потребує --no-sandbox "
+                "(цей код вже додає його сам; стара версія падала мовчки).")
     ui_dir = ROOT / "ui"
     log(f"  ui/package.json: {'OK' if (ui_dir / 'package.json').exists() else 'НЕМА (запуск не з кореня репозиторію?)'}")
     _exe = _electron_bin_path(ui_dir)
@@ -3974,6 +4057,24 @@ def check_gui():
     _npm = shutil.which("npm.cmd") or shutil.which("npm")
     log(f"  node: {_node if _node else 'НЕМА (https://nodejs.org)'}")
     log(f"  npm: {_npm if _npm else 'НЕМА (https://nodejs.org)'}")
+    if _node and os.name != "nt":
+        try:
+            _r = subprocess.run([_node, "--version"], capture_output=True, text=True, timeout=10,
+                                encoding="utf-8", errors="replace")
+            _ver = (_r.stdout or "").strip()
+            log(f"  node version: {_ver or '?'}")
+            if _ver.startswith("v"):
+                try:
+                    _major = int(_ver[1:].split(".")[0])
+                    if _major < 18:
+                        log("  node: ЗАСТАРИЙ (<18). Electron 28 потребує Node 18+. "
+                            "apt дає старий node — поставте LTS з https://nodejs.org "
+                            "або через NodeSource (див. scripts/setup_linux.sh). "
+                            "Інакше npm install впаде.")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def offer_install_compiler(auto_yes=False):
