@@ -2109,18 +2109,40 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             try:
                 log_cmd(["npm", "install", "--no-audit", "--no-fund"])
                 _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
-                # npm 11+: postinstall Electron блокується ("install scripts blocked"),
-                # бінарник не качається. `install-scripts ls` питаємо ПІСЛЯ install,
-                # але approve пробуємо завжди коли бінарника нема (ls до install
-                # каже "No packages..." бо node_modules ще нема).
+                # npm 12 блокить postinstall за замовчуванням (allowScripts).
+                # approve пробуємо завжди коли бінарника нема (ls до install
+                # каже "No packages..." бо node_modules ще нема; на npm 12
+                # команда — `npm approve-scripts`, старий alias теж пробуємо).
                 if not electron_exe.exists():
                     try:
                         log("npm: бінарника Electron нема — пробую дозволити postinstall...")
-                        subprocess.run([_npm_try, "install-scripts", "approve", "electron"],
-                                       cwd=str(ui_dir), timeout=60,
-                                       capture_output=True)
+                        for _cmd in (["approve-scripts", "electron"],
+                                     ["install-scripts", "approve", "electron"]):
+                            try:
+                                subprocess.run([_npm_try] + _cmd,
+                                               cwd=str(ui_dir), timeout=60,
+                                               capture_output=True)
+                            except Exception:
+                                pass
                         log_cmd(["npm", "install", "--no-audit", "--no-fund"])
                         _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
+                        if not electron_exe.exists():
+                            # Прапорець напряму + ручний install.js
+                            # (ручний обходить і блок, і битий extract-zip на Node 26).
+                            try:
+                                subprocess.run(_inst + ["--allow-scripts=electron"],
+                                               cwd=str(ui_dir), timeout=600,
+                                               capture_output=True)
+                            except Exception:
+                                pass
+                            _ij = ui_dir / "node_modules" / "electron" / "install.js"
+                            if not electron_exe.exists() and _ij.is_file():
+                                log("Пробую ручний node install.js...")
+                                try:
+                                    subprocess.run([shutil.which("node") or "node", str(_ij)],
+                                                   cwd=str(ui_dir), timeout=300)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                 if _ir.returncode == 0 and electron_exe.exists():
@@ -2128,8 +2150,9 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                 else:
                     log(f"npm install завершився з кодом {_ir.returncode}. "
                         "Якщо Electron не стартує — спробуйте вручну: cd ui && npm install, "
-                        "а при 'install scripts blocked': "
-                        "npm install-scripts approve electron && npm install.")
+                        "npm 12: npm approve-scripts electron && npm install. "
+                        "Node 26 ламає розпаковку Electron 28: потрібен Node 20 LTS "
+                        "(nvm install 20 && nvm use 20).")
             except Exception as e:
                 log(f"npm install не вдався ({e}) — продовжую без CyberDeck.")
         else:

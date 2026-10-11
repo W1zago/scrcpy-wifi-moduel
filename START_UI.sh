@@ -43,16 +43,22 @@ install_ui_deps() {
     echo "[UI] Часті причини на Linux: старий node (<18), нема build-essential/python3."
     return 1
   fi
-  # npm 11+: postinstall Electron блокується за замовчуванням
-  # ("install scripts blocked ... electron postinstall: node install.js"),
-  # бінарник не качається і далі падає з "Electron failed to install correctly".
-  # ВАЖЛИВО: `npm install-scripts ls` треба питати ПІСЛЯ install (до нього
-  # node_modules нема і він каже "No packages..."). Тому не покладаємось на ls,
-  # а завжди пробуємо approve коли бінарника нема.
+  # npm 12 блокить postinstall за замовчуванням (allowScripts).
+  # Пробуємо всі відомі способи дозволу: новий синтаксис v12, старий alias,
+  # прапорець --allow-scripts. `ls` питаємо ПІСЛЯ install.
   if [ ! -x "node_modules/electron/dist/electron" ]; then
     echo "[UI] Бінарника Electron нема — пробую дозволити postinstall..."
-    npm install-scripts approve electron 2>/dev/null || true
+    npm approve-scripts electron 2>/dev/null || npm install-scripts approve electron 2>/dev/null || true
     npm install --no-audit --no-fund || true
+    if [ ! -x "node_modules/electron/dist/electron" ]; then
+      npm install --no-audit --no-fund --allow-scripts=electron 2>/dev/null || true
+    fi
+    # Останній шанс без npm-хуків: запустити install.js вручну
+    # (обходить і блок, і битий extract на нових Node).
+    if [ ! -x "node_modules/electron/dist/electron" ] && [ -f "node_modules/electron/install.js" ]; then
+      echo "[UI] Пробую ручний node install.js..."
+      node node_modules/electron/install.js || true
+    fi
   fi
   # Останній шанс: бита папка electron без бінарника — знести і поставити начисто.
   if [ ! -x "node_modules/electron/dist/electron" ] && [ -d "node_modules/electron" ]; then
@@ -63,8 +69,11 @@ install_ui_deps() {
   if [ ! -x "node_modules/electron/dist/electron" ]; then
     echo "[UI] ERROR: Electron так і не встановився."
     echo "[UI] Вручну: cd ui && rm -rf node_modules package-lock.json && npm install"
-    echo "[UI] Якщо npm пише 'install scripts blocked':"
-    echo "[UI]   npm install-scripts approve electron && npm install"
+    echo "[UI] npm 12: npm approve-scripts electron && npm install"
+    echo "[UI] (старий синтаксис: npm install-scripts approve electron && npm install)"
+    echo "[UI] Node 26 ламає розпаковку Electron 28 (extract-zip): поставте Node 20 LTS"
+    echo "[UI] через nvm (nvm install 20 && nvm use 20) і повторіть install."
+    echo "[UI] Або системний Electron з Arch: sudo pacman -S electron"
     return 1
   fi
   # chrome-sandbox без setuid-root часто блокує старт Electron на Debian/Ubuntu
