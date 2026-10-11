@@ -2109,12 +2109,29 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
             try:
                 log_cmd(["npm", "install", "--no-audit", "--no-fund"])
                 _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
+                # npm 11+: postinstall Electron блокується ("install scripts blocked"),
+                # бінарник не качається. Дозволяємо і доставляємо.
+                if not electron_exe.exists():
+                    try:
+                        _ls = subprocess.run([_npm_try, "install-scripts", "ls"],
+                                             cwd=str(ui_dir), capture_output=True,
+                                             text=True, timeout=30,
+                                             encoding="utf-8", errors="replace")
+                        if "electron" in (_ls.stdout or ""):
+                            log("npm заблокував postinstall Electron — дозволяю...")
+                            subprocess.run([_npm_try, "install-scripts", "approve", "electron"],
+                                           cwd=str(ui_dir), timeout=60)
+                            log_cmd(["npm", "install", "--no-audit", "--no-fund"])
+                            _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
+                    except Exception:
+                        pass
                 if _ir.returncode == 0 and electron_exe.exists():
                     log("Залежності UI встановлено.")
                 else:
                     log(f"npm install завершився з кодом {_ir.returncode}. "
                         "Якщо Electron не стартує — спробуйте вручну: cd ui && npm install, "
-                        "і покажіть текст помилки.")
+                        "а при 'install scripts blocked': "
+                        "npm install-scripts approve electron && npm install.")
             except Exception as e:
                 log(f"npm install не вдався ({e}) — продовжую без CyberDeck.")
         else:
@@ -4053,6 +4070,10 @@ def check_gui():
         log("  electron: НЕМА — для CyberDeck вікна одноразово: cd ui && npm install "
             "(потрібен Node.js LTS з https://nodejs.org). "
             "Без нього працюватиме стандартне вікно (tkinter).")
+        if (ui_dir / "node_modules" / "electron").exists():
+            log("  підказка: папка node_modules/electron є, але без бінарника — "
+                "це блокований postinstall (npm 11+: 'install scripts blocked'). "
+                "Лікується: cd ui && npm install-scripts approve electron && npm install")
     _node = shutil.which("node")
     _npm = shutil.which("npm.cmd") or shutil.which("npm")
     log(f"  node: {_node if _node else 'НЕМА (https://nodejs.org)'}")

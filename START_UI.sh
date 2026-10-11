@@ -36,17 +36,47 @@ if command -v node >/dev/null 2>&1; then
   fi
 fi
 
-if [ ! -x "node_modules/electron/dist/electron" ]; then
+install_ui_deps() {
   echo "[UI] First run: installing UI dependencies (npm install, 1-3 min)..."
   if ! npm install --no-audit --no-fund; then
     echo "[UI] ERROR: npm install failed - read the messages above."
     echo "[UI] Часті причини на Linux: старий node (<18), нема build-essential/python3."
-    read -r -p "[UI] Press Enter to close this window..." _ || true
-    exit 1
+    return 1
+  fi
+  # npm 11+: postinstall Electron блокується за замовчуванням
+  # ("install scripts blocked ... electron postinstall: node install.js"),
+  # бінарник не качається і далі падає з "Electron failed to install correctly".
+  if [ ! -x "node_modules/electron/dist/electron" ]; then
+    if npm install-scripts ls 2>/dev/null | grep -q "electron"; then
+      echo "[UI] npm заблокував postinstall Electron — дозволяю і доставляю..."
+      npm install-scripts approve electron 2>/dev/null || true
+      npm install --no-audit --no-fund || true
+    fi
+  fi
+  # Останній шанс: бита папка electron без бінарника — знести і поставити начисто.
+  if [ ! -x "node_modules/electron/dist/electron" ] && [ -d "node_modules/electron" ]; then
+    echo "[UI] Electron без бінарника — перевстановлюю начисто..."
+    rm -rf node_modules/electron
+    npm install --no-audit --no-fund || return 1
+  fi
+  if [ ! -x "node_modules/electron/dist/electron" ]; then
+    echo "[UI] ERROR: Electron так і не встановився."
+    echo "[UI] Вручну: cd ui && rm -rf node_modules package-lock.json && npm install"
+    echo "[UI] Якщо npm пише 'install scripts blocked':"
+    echo "[UI]   npm install-scripts approve electron && npm install"
+    return 1
   fi
   # chrome-sandbox без setuid-root часто блокує старт Electron на Debian/Ubuntu
   if [ -f "node_modules/electron/dist/chrome-sandbox" ]; then
     chmod +x node_modules/electron/dist/electron 2>/dev/null || true
+  fi
+  return 0
+}
+
+if [ ! -x "node_modules/electron/dist/electron" ]; then
+  if ! install_ui_deps; then
+    read -r -p "[UI] Press Enter to close this window..." _ || true
+    exit 1
   fi
 fi
 
@@ -73,7 +103,11 @@ if [ "$RC" -ne 0 ]; then
   echo "[UI] Якщо вікно не з'явилось — дивіться рядки вище з [UI-ERR]/libnss/libatk."
   echo "[UI] Діагностика: ./START.sh check"
   echo "[UI] Fallback без Electron: python3 tools/auto_run.py --mode auto (tkinter-вікно)"
-  echo "[UI] Потрібен python3-tk: sudo apt-get install -y python3-tk"
+  if command -v pacman >/dev/null 2>&1; then
+    echo "[UI] Потрібен tk: sudo pacman -S --needed tk"
+  else
+    echo "[UI] Потрібен python3-tk: sudo apt-get install -y python3-tk"
+  fi
 fi
 read -r -p "[UI] Press Enter to close this window..." _ || true
 exit "$RC"
