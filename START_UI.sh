@@ -36,6 +36,67 @@ if command -v node >/dev/null 2>&1; then
   fi
 fi
 
+repair_electron_manual() {
+  # Ручне дотягування бінарника Electron без npm-хуків.
+  # Навіщо: Node 24/26 ламає вбудований extract-zip в Electron 28
+  # (після install в dist/ лишається тільки locales/, бінарника нема),
+  # а npm 12 ще й ріже postinstall. Качаємо офіційний zip з GitHub
+  # через python3-stdlib (curl/unzip не потрібні) і розпаковуємо самі.
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  echo "[UI] Дотягую бінарник Electron вручну (обхід битого extract-zip на Node 24/26)..."
+  EVER=$(python3 -c "import json;print(json.load(open('node_modules/electron/package.json')).get('version',''))" 2>/dev/null)
+  if [ -z "${EVER:-}" ]; then
+    EVER=$(python3 -c "import json;d=json.load(open('package-lock.json'));print(d.get('packages',{}).get('node_modules/electron',{}).get('version',''))" 2>/dev/null)
+  fi
+  if [ -z "${EVER:-}" ]; then EVER="28.3.3"; fi
+  MACHINE=$(uname -m 2>/dev/null || echo x86_64)
+  case "$MACHINE" in
+    x86_64|amd64) EARCH="x64" ;;
+    aarch64|arm64) EARCH="arm64" ;;
+    *) echo "[UI] Невідома архітектура: $MACHINE"; return 1 ;;
+  esac
+  EURL="https://github.com/electron/electron/releases/download/v${EVER}/electron-v${EVER}-linux-${EARCH}.zip"
+  echo "[UI] Качаю: $EURL"
+  if ! python3 - "$EURL" <<'PYEOF'
+import sys, urllib.request, zipfile, os
+url = sys.argv[1]
+tmp = "/tmp/electron-fix.zip"
+try:
+    urllib.request.urlretrieve(url, tmp)
+except Exception as e:
+    print(f"[UI] download failed: {e}")
+    sys.exit(1)
+try:
+    os.makedirs("node_modules/electron/dist", exist_ok=True)
+    with zipfile.ZipFile(tmp, "r") as z:
+        z.extractall("node_modules/electron/dist")
+except Exception as e:
+    print(f"[UI] extract failed: {e}")
+    sys.exit(1)
+# path.txt чекає index.js (npm start йде через нього)
+try:
+    pt = "node_modules/electron/path.txt"
+    if not os.path.exists(pt):
+        with open(pt, "w") as f:
+            f.write("dist/electron")
+except Exception:
+    pass
+print("[UI] manual extract OK")
+PYEOF
+  then
+    return 1
+  fi
+  chmod +x node_modules/electron/dist/electron 2>/dev/null || true
+  # Перевірка як в самому electron/index.js
+  if node -e "require('./node_modules/electron')" 2>/dev/null; then
+    echo "[UI] Ручний ремонт вдався."
+    return 0
+  fi
+  return 1
+}
+
 install_ui_deps() {
   echo "[UI] First run: installing UI dependencies (npm install, 1-3 min)..."
   if ! npm install --no-audit --no-fund; then
@@ -58,6 +119,11 @@ install_ui_deps() {
     if [ ! -x "node_modules/electron/dist/electron" ] && [ -f "node_modules/electron/install.js" ]; then
       echo "[UI] Пробую ручний node install.js..."
       node node_modules/electron/install.js || true
+    fi
+    # Node 24/26 + Electron 28: install.js відпрацьовує мовчки, а в dist/
+    # лишається тільки locales/. Дотягуємо офіційний zip самі.
+    if [ ! -x "node_modules/electron/dist/electron" ]; then
+      repair_electron_manual || true
     fi
   fi
   # Останній шанс: бита папка electron без бінарника — знести і поставити начисто.

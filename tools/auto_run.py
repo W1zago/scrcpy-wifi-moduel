@@ -2072,6 +2072,79 @@ def _gui_disconnect_others(devices_snapshot, keep_ip):
                     pass
 
 
+def _repair_electron_dist(ui_dir):
+    """Дотягнути бінарник Electron вручну без npm-хуків.
+
+    Навіщо: Node 24/26 ламає вбудований extract-zip в Electron 28 —
+    після install в dist/ лишається тільки locales/, бінарника нема.
+    Качаємо офіційний zip з GitHub через stdlib (urllib/zipfile) і
+    розпаковуємо самі. Повертає True якщо dist/electron з'явився.
+    """
+    import json
+    import platform
+    import urllib.request
+    import zipfile
+    try:
+        edir = Path(ui_dir) / "node_modules" / "electron"
+        dist = edir / "dist"
+        exe = _electron_bin_path(Path(ui_dir))
+        if exe.exists():
+            return True
+        ver = ""
+        try:
+            ver = json.loads((edir / "package.json").read_text(encoding="utf-8")).get("version", "")
+        except Exception:
+            ver = ""
+        if not ver:
+            try:
+                lock = json.loads((Path(ui_dir) / "package-lock.json").read_text(encoding="utf-8"))
+                ver = lock.get("packages", {}).get("node_modules/electron", {}).get("version", "")
+            except Exception:
+                ver = ""
+        if not ver:
+            ver = "28.3.3"
+        mach = platform.machine().lower()
+        if mach in ("x86_64", "amd64"):
+            arch = "x64"
+        elif mach in ("aarch64", "arm64"):
+            arch = "arm64"
+        else:
+            log(f"Невідома архітектура для ручного ремонту Electron: {mach}")
+            return False
+        url = f"https://github.com/electron/electron/releases/download/v{ver}/electron-v{ver}-linux-{arch}.zip"
+        log(f"Дотягую бінарник Electron вручну: {url}")
+        tmp = Path("/tmp/electron-fix.zip")
+        try:
+            urllib.request.urlretrieve(url, str(tmp))
+        except Exception as e:
+            log(f"Не вдалося скачати Electron: {e}")
+            return False
+        try:
+            dist.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(str(tmp), "r") as z:
+                z.extractall(str(dist))
+        except Exception as e:
+            log(f"Не вдалося розпакувати Electron: {e}")
+            return False
+        try:
+            pt = edir / "path.txt"
+            if not pt.exists():
+                pt.write_text("dist/electron", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            os.chmod(str(exe), 0o755)
+        except Exception:
+            pass
+        if exe.exists():
+            log("Ручний ремонт Electron вдався.")
+            return True
+        return False
+    except Exception as e:
+        log(f"Ручний ремонт Electron не вдався: {e}")
+        return False
+
+
 def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=0.45, pair_code=None,
                                 scan_ports=None):
     """Спроба відкрити CyberDeck Electron UI. Повертає (ip, port, ok) або None якщо не вдалося."""
@@ -2141,6 +2214,14 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                                 try:
                                     subprocess.run([shutil.which("node") or "node", str(_ij)],
                                                    cwd=str(ui_dir), timeout=300)
+                                except Exception:
+                                    pass
+                            # Node 24/26 + Electron 28: install.js мовчки лишає
+                            # тільки locales/ — дотягуємо офіційний zip самі.
+                            if not electron_exe.exists():
+                                try:
+                                    _repair_electron_dist(ui_dir)
+                                    electron_exe = _electron_bin_path(ui_dir)
                                 except Exception:
                                     pass
                     except Exception:
