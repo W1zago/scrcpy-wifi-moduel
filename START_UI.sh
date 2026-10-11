@@ -46,12 +46,13 @@ install_ui_deps() {
   # npm 11+: postinstall Electron блокується за замовчуванням
   # ("install scripts blocked ... electron postinstall: node install.js"),
   # бінарник не качається і далі падає з "Electron failed to install correctly".
+  # ВАЖЛИВО: `npm install-scripts ls` треба питати ПІСЛЯ install (до нього
+  # node_modules нема і він каже "No packages..."). Тому не покладаємось на ls,
+  # а завжди пробуємо approve коли бінарника нема.
   if [ ! -x "node_modules/electron/dist/electron" ]; then
-    if npm install-scripts ls 2>/dev/null | grep -q "electron"; then
-      echo "[UI] npm заблокував postinstall Electron — дозволяю і доставляю..."
-      npm install-scripts approve electron 2>/dev/null || true
-      npm install --no-audit --no-fund || true
-    fi
+    echo "[UI] Бінарника Electron нема — пробую дозволити postinstall..."
+    npm install-scripts approve electron 2>/dev/null || true
+    npm install --no-audit --no-fund || true
   fi
   # Останній шанс: бита папка electron без бінарника — знести і поставити начисто.
   if [ ! -x "node_modules/electron/dist/electron" ] && [ -d "node_modules/electron" ]; then

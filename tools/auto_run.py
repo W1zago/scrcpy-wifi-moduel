@@ -2110,19 +2110,17 @@ def electron_gui_pick_and_connect(adb_port=5555, mdns_timeout=2.5, scan_timeout=
                 log_cmd(["npm", "install", "--no-audit", "--no-fund"])
                 _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
                 # npm 11+: postinstall Electron блокується ("install scripts blocked"),
-                # бінарник не качається. Дозволяємо і доставляємо.
+                # бінарник не качається. `install-scripts ls` питаємо ПІСЛЯ install,
+                # але approve пробуємо завжди коли бінарника нема (ls до install
+                # каже "No packages..." бо node_modules ще нема).
                 if not electron_exe.exists():
                     try:
-                        _ls = subprocess.run([_npm_try, "install-scripts", "ls"],
-                                             cwd=str(ui_dir), capture_output=True,
-                                             text=True, timeout=30,
-                                             encoding="utf-8", errors="replace")
-                        if "electron" in (_ls.stdout or ""):
-                            log("npm заблокував postinstall Electron — дозволяю...")
-                            subprocess.run([_npm_try, "install-scripts", "approve", "electron"],
-                                           cwd=str(ui_dir), timeout=60)
-                            log_cmd(["npm", "install", "--no-audit", "--no-fund"])
-                            _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
+                        log("npm: бінарника Electron нема — пробую дозволити postinstall...")
+                        subprocess.run([_npm_try, "install-scripts", "approve", "electron"],
+                                       cwd=str(ui_dir), timeout=60,
+                                       capture_output=True)
+                        log_cmd(["npm", "install", "--no-audit", "--no-fund"])
+                        _ir = subprocess.run(_inst, cwd=str(ui_dir), timeout=600)
                     except Exception:
                         pass
                 if _ir.returncode == 0 and electron_exe.exists():
