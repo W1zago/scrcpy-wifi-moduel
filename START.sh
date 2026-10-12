@@ -26,6 +26,9 @@ case "${1:-}" in
   check)   exec "$PY" tools/auto_run.py --check ;;
   dry-run) exec "$PY" tools/auto_run.py --dry-run ;;
   install) exec "$PY" tools/auto_run.py --install-deps --mode auto ;;
+  update)  exec "$PY" tools/auto_run.py --update "${@:2}" ;;
+  --update) exec "$PY" tools/auto_run.py --update "${@:2}" ;;
+  --update-check) exec "$PY" tools/auto_run.py --update-check ;;
   "")      exec "$PY" tools/auto_run.py --mode auto ;;
   *)       exec "$PY" tools/auto_run.py "$@" ;;
 esac

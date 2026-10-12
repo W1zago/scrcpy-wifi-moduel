@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WIN_LAUNCHERS = ["START.bat", "START_CONSOLE.bat", "START_UI.bat"]
 LINUX_LAUNCHERS = ["START.sh", "START_CONSOLE.sh", "START_UI.sh"]
 ALWAYS = ["tools", "ui", "scripts", "src", "CMakeLists.txt", "README.md",
-          "LICENSE", "ARCHITECTURE.md", "run_simulation.py"]
+          "LICENSE", "ARCHITECTURE.md", "run_simulation.py", "VERSION"]
 
 SKIP_DIRS = {"__pycache__", "node_modules", ".git"}
 SKIP_SUFFIXES = (".pyc",)

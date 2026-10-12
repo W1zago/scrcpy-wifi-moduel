@@ -4373,6 +4373,10 @@ def main():
                     help="No window - console prompts only")
     ap.add_argument("--electron-mode", action="store_true",
                     help="JSON event mode for Electron GUI")
+    ap.add_argument("--update", action="store_true",
+                    help="Download and install update from GitHub Releases (explicit only)")
+    ap.add_argument("--update-check", action="store_true",
+                    help="Only show if a newer version exists, install nothing")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -4387,6 +4391,14 @@ def main():
         print("=== mDNS air diagnostics ===", flush=True)
         mdns_listen_check()
         return 0
+
+    if getattr(args, "update_check", False):
+        from tools.updater import run_check
+        return run_check()
+
+    if getattr(args, "update", False):
+        from tools.updater import run_update
+        return run_update(yes=bool(getattr(args, "yes", False)))
 
     if args.electron_mode:
         _cli_scan_ports = [p for p in parse_scan_ports(args.scan_ports, args.adb_port)

@@ -212,7 +212,35 @@ START.bat --phone-ip 192.168.0.XX :: connect directly by IP (find it on the phon
 START_CONSOLE.bat                 :: console only, never opens a window
 ```
 
-### 5. Diagnostics
+### 5. Updating
+
+No need to delete the folder and re-download the ZIP from GitHub.
+Run the built-in updater explicitly (no automatic checks on startup):
+
+```cmd
+START.bat update              :: download + install the latest release
+START.bat --update-check      :: only show if a newer version exists
+python tools\auto_run.py --update --yes   :: no questions (for scripts)
+```
+
+Linux:
+
+```bash
+./START.sh update
+./START.sh --update-check
+```
+
+How it works: the updater fetches the latest GitHub Release for your OS
+(`win64.zip` / `linux.tar.gz`), stages it in a temp folder, backs up the
+current install to `backup_v<old>/`, then applies the files after the
+Python process exits (`apply_update.bat` / `apply_update.sh`) and writes
+the new version to the `VERSION` file.
+
+> **Note:** set your repository in `tools/updater.py` (`REPO`) or via the
+> `SCRCPY_WIFI_REPO` env var (`owner/repo`), otherwise the check reports
+> that it cannot reach the release.
+
+### 6. Diagnostics
 
 ```cmd
 START.bat check
@@ -236,7 +264,7 @@ Typical problems:
 > "virtual USB cable" feature. Plain screen mirroring via scrcpy over Wi-Fi
 > works **without them** (the program falls back to TCP mode by itself).
 
-### 6. Linux (Debian/Ubuntu and Arch)
+### 7. Linux (Debian/Ubuntu and Arch)
 
 Download — via git:
 

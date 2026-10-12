@@ -25,6 +25,9 @@ if "%~1"=="real" goto :REAL
 if "%~1"=="check" goto :CHECK
 if "%~1"=="dry-run" goto :DRYRUN
 if "%~1"=="install" goto :INSTALL
+if "%~1"=="update" goto :UPDATE
+if "%~1"=="--update" goto :UPDATE
+if "%~1"=="--update-check" goto :UPDATECHECK
 if "%~1"=="" goto :AUTO
 goto :CUSTOM
 
@@ -50,6 +53,14 @@ goto :DONE
 
 :INSTALL
 %PY% tools\auto_run.py --install-deps --mode auto
+goto :DONE
+
+:UPDATE
+%PY% tools\auto_run.py --update %2 %3 %4 %5
+goto :DONE
+
+:UPDATECHECK
+%PY% tools\auto_run.py --update-check
 goto :DONE
 
 :CUSTOM
