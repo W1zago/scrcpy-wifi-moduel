@@ -4393,12 +4393,22 @@ def main():
         return 0
 
     if getattr(args, "update_check", False):
-        from tools.updater import run_check
-        return run_check()
+        from pathlib import Path as _P
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "updater", str(_P(__file__).resolve().parent / "updater.py"))
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod.run_check()
 
     if getattr(args, "update", False):
-        from tools.updater import run_update
-        return run_update(yes=bool(getattr(args, "yes", False)))
+        from pathlib import Path as _P2
+        import importlib.util as _ilu2
+        _spec2 = _ilu2.spec_from_file_location(
+            "updater", str(_P2(__file__).resolve().parent / "updater.py"))
+        _mod2 = _ilu2.module_from_spec(_spec2)
+        _spec2.loader.exec_module(_mod2)
+        return _mod2.run_update(yes=bool(getattr(args, "yes", False)))
 
     if args.electron_mode:
         _cli_scan_ports = [p for p in parse_scan_ports(args.scan_ports, args.adb_port)

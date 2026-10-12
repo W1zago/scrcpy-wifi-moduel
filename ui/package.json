@@ -1,6 +1,6 @@
 {
   "name": "scrcpy-wifi-cable",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Virtual USB Cable & scrcpy Wireless Manager UI",
   "main": "electron/main.js",
   "scripts": {

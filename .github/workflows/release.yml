@@ -53,7 +53,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Python syntax check
-        run: python -m py_compile tools/auto_run.py scripts/package_release.py run_simulation.py
+        run: python -m py_compile tools/auto_run.py tools/updater.py scripts/package_release.py
 
       - name: Package release archive
         run: python scripts/package_release.py --platform ${{ matrix.platform }} --out dist/${{ matrix.archive }}

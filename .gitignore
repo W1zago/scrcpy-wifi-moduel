@@ -1,7 +1,22 @@
-node_modules/ 
-ui/node_modules/ 
-# стан рантайму (останній пристрій) — не комітити
-build/last_phone.txt
-# всі zip-архіви — не комітити, щоб не було видно на GitHub
+node_modules/
+ui/node_modules/
+# python cache — не комітити
+__pycache__/
+*/__pycache__/
+*__pycache__/
+*.pyc
+*.pyo
+# збірка cmake / пакети — не комітити (їх робить CI релізу)
+build/
+dist/
+# всі архіви — не комітити, їх створює GitHub Release
 *.zip
 *.ZIP
+*.tar.gz
+# стан рантайму (останній пристрій) — не комітити
+build/last_phone.txt
+last_phone.txt
+# бекапи апдейтера і тимчасові apply-скрипти
+backup_v*/
+apply_update.bat
+apply_update.sh

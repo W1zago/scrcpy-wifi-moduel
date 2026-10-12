@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = ROOT / "VERSION"
 
 # TODO: замініть на свій репозиторій, напр. "user/scrcpy-wifi-module"
-REPO = os.environ.get("SCRCPY_WIFI_REPO", "REPLACE_ME/scrcpy-wifi-moduel")
+REPO = os.environ.get("SCRCPY_WIFI_REPO", "W1zago/scrcpy-wifi-moduel")
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 
 ASSET_HINTS = {
