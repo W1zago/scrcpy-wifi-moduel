@@ -45,12 +45,12 @@ ensure_node18_apt() {
   if command -v node >/dev/null 2>&1; then
     MAJ=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
     if [ "${MAJ:-0}" -ge 18 ] 2>/dev/null; then
-      ok "node $(node --version) вже 18+, NodeSource не потрібен."
+      ok "node $(node --version) is already 18+, NodeSource not needed."
       return 0
     fi
-    warn "node $(node --version 2>/dev/null) застарий — ставлю Node.js LTS 20 через NodeSource..."
+    warn "node $(node --version 2>/dev/null) is too old - installing Node.js LTS 20 via NodeSource..."
   else
-    echo "[AUTO] Node.js не знайдено — ставлю LTS 20 через NodeSource..."
+    echo "[AUTO] Node.js not found - installing LTS 20 via NodeSource..."
   fi
   if ! command -v curl >/dev/null 2>&1; then
     # shellcheck disable=SC2086
@@ -58,7 +58,7 @@ ensure_node18_apt() {
   fi
   # shellcheck disable=SC2086
   curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash - || {
-    warn "NodeSource не вдався — ставлю nodejs з apt як є (може бути старий!)."
+    warn "NodeSource failed - installing nodejs from apt as-is (may be old!)."
     return 1
   }
   return 0
@@ -90,12 +90,12 @@ done
 if python3 -c "import tkinter" 2>/dev/null; then
   ok "python3-tk (tkinter) OK."
 else
-  warn "tkinter НЕМА — вікна не буде. Доставте: sudo apt-get install -y python3-tk  (Arch: sudo pacman -S --needed tk)"
+  warn "tkinter MISSING - no window will appear. Install it: sudo apt-get install -y python3-tk  (Arch: sudo pacman -S --needed tk)"
 fi
 if command -v node >/dev/null 2>&1; then
   MAJ=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
   if [ "${MAJ:-0}" -lt 18 ] 2>/dev/null; then
-    warn "node $(node --version) < 18 — Electron 28 / npm install можуть впасти. Поставте LTS з https://nodejs.org"
+    warn "node $(node --version) < 18 - Electron 28 / npm install may fail. Install LTS from https://nodejs.org"
   fi
 fi
 
@@ -117,5 +117,5 @@ adb start-server || true
 adb devices -l || true
 
 echo
-echo "[AUTO] Перевірка UI: python3 tools/auto_run.py --check  (розділ 'вікна (GUI)')"
+echo "[AUTO] UI check: python3 tools/auto_run.py --check  (section 'windows (GUI)')"
 echo "[AUTO] ===== Done. Next just: ./START.sh  (or python3 tools/auto_run.py) ====="

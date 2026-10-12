@@ -180,24 +180,24 @@ void print_usage(const char* prog) {
     printf("  --adb <host:port>      adbd address (default 127.0.0.1:5555)\n");
     printf("  --listen <host:port>   WAN listen address (default 0.0.0.0:22777)\n");
     printf("  --simulate-adb         Run fake adbd on --adb port (for Windows test)\n");
-    printf("  --auto                САМ вводить всі команди: adb start-server, adb tcpip,\n");
-    printf("                        визначення IP телефону, СКАНУВАННЯ всієї LAN зі списком\n");
-    printf("                        'IP — назва пристрою' і вибором. Нічого вводити не треба.\n");
-    printf("  --phone-ip <ip>       IP телефону (якщо автовизначення не спрацювало)\n");
-    printf("  --adb-port <port>     Порт tcpip (default 5555)\n");
-    printf("  --scan                Примусово просканувати LAN і запропонувати вибір,\n");
-    printf("                        навіть якщо телефон вже підключено\n");
-    printf("  --no-scan             НЕ шукати в мережі (тільки USB/--phone-ip)\n");
-    printf("  --pick <N|IP>         Автовибір пристрою без запиту (номер зі списку або IP)\n");
-    printf("  --pair-code <код>     6-значний код парування (Бездротове налагодження без кабелю)\n");
+    printf("  --auto                Automatically runs all commands: adb start-server, adb tcpip,\n");
+    printf("                        phone IP detection, full LAN scan with a list\n");
+    printf("                        'IP - device name' and selection. No manual input needed.\n");
+    printf("  --phone-ip <ip>       Phone IP (if auto-detection failed)\n");
+    printf("  --adb-port <port>     tcpip port (default 5555)\n");
+    printf("  --scan                Force LAN scan and offer selection,\n");
+    printf("                        even if the phone is already connected\n");
+    printf("  --no-scan             Do NOT scan the network (only USB/--phone-ip)\n");
+    printf("  --pick <N|IP>         Auto-select device without prompt (list number or IP)\n");
+    printf("  --pair-code <code>    6-digit pairing code (Wireless debugging without cable)\n");
     printf("  --help                 Show help\n");
     printf("\nExamples:\n");
     printf("  Android: %s --adb 127.0.0.1:5555 --listen 0.0.0.0:22777\n", prog);
     printf("  Windows sim: %s --simulate-adb --adb 127.0.0.1:5555 --listen 0.0.0.0:22777\n", prog);
-    printf("  AUTO (реальний телефон по USB): %s --auto --listen 0.0.0.0:22777\n", prog);
-    printf("  AUTO (скан мережі + вибір): %s --auto --scan\n", prog);
-    printf("  AUTO (БЕЗ кабелю, Android 11+): %s --auto  (підкаже що ввести з екрану)\n", prog);
-    printf("  AUTO (демо без телефону): %s --auto --simulate-adb\n", prog);
+    printf("  AUTO (real phone over USB): %s --auto --listen 0.0.0.0:22777\n", prog);
+    printf("  AUTO (network scan + pick): %s --auto --scan\n", prog);
+    printf("  AUTO (NO cable, Android 11+): %s --auto  (prompts what to enter from the screen)\n", prog);
+    printf("  AUTO (demo without phone): %s --auto --simulate-adb\n", prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -256,18 +256,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("=== Virtual USB Cable — Agent-Sender ===\n");
+    printf("=== Virtual USB Cable - Agent-Sender ===\n");
     printf("ADB: %s:%u  Listen: %s:%u  Simulate: %s  Auto: %s\n",
            adb_host, adb_port, listen_host, listen_port, simulate_adb ? "yes" : "no",
            auto_mode ? "yes" : "no");
 
     // --- AUTO: сам вводимо всі adb-команди ---
     if (auto_mode && !simulate_adb) {
-        printf("\n[AUTO] ===== Авторежим Sender: сам виконую adb-команди =====\n");
+        printf("\n[AUTO] ===== Sender auto mode: running all adb commands automatically =====\n");
         autosetup::EnsureAdbServer();
         autosetup::PrintAdbDevices();
         if (!phone_ip_override.empty()) {
-            printf("[AUTO] Використовую заданий --phone-ip=%s\n", phone_ip_override.c_str());
+            printf("[AUTO] Using given --phone-ip=%s\n", phone_ip_override.c_str());
             autosetup::AdbConnect(phone_ip_override, adb_port);
             // Після connect телефон доступний за phone_ip:port — перемикаємо adb_host
             static char auto_hbuf[256];
@@ -286,14 +286,14 @@ int main(int argc, char* argv[]) {
                 auto_hbuf2[sizeof(auto_hbuf2)-1] = '\0';
                 adb_host = auto_hbuf2;
                 adb_port = (uint16_t)atoi(conn.substr(colon + 1).c_str());
-                printf("[AUTO] Телефон готовий: %s (adbd %s:%u)\n", conn.c_str(), adb_host, adb_port);
+                printf("[AUTO] Phone ready: %s (adbd %s:%u)\n", conn.c_str(), adb_host, adb_port);
             } else {
-                printf("[AUTO] Телефон по Wi-Fi не налаштовано. Якщо телефону нема — перезапустіть з --simulate-adb.\n");
-                printf("[AUTO] Продовжую слухати WAN — Receiver може підключитись в демо-режимі.\n");
+                printf("[AUTO] Phone not set up over Wi-Fi. If there is no phone - restart with --simulate-adb.\n");
+                printf("[AUTO] Continuing to listen on WAN - Receiver can connect in demo mode.\n");
             }
         }
         autosetup::PrintAdbDevices();
-        printf("[AUTO] ===== Автонастройка Sender завершена =====\n\n");
+        printf("[AUTO] ===== Sender auto-setup finished =====\n\n");
     }
 
 #ifdef _WIN32
@@ -383,7 +383,7 @@ int main(int argc, char* argv[]) {
 
         printf("[SENDER] Bridge active. Forwarding ADB <-> WAN\n");
         printf("[SENDER] Run on Windows: agent_receiver.exe --server %s:%u --simulate\n",
-               "127.0.0.1", listen_port); // підказка
+               "127.0.0.1", listen_port); // hint
 
         // Чекаємо поки клієнт відключиться або Ctrl+C
         while (g_running) {
@@ -417,7 +417,7 @@ int main(int argc, char* argv[]) {
 
 #else
     // Linux/Android — аналогічно, але з POSIX sockets
-    printf("[SENDER] Linux/Android build — POSIX sockets (see Windows code for logic)\n");
+    printf("[SENDER] Linux/Android build - POSIX sockets (see Windows code for logic)\n");
     // Для NDK — той самий код з close() замість closesocket()
 #endif
 

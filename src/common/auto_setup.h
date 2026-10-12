@@ -227,15 +227,15 @@ inline void PrintAdbDevices() {
         printf("[AUTO]   - %s  state=%s transport=%s\n", d.serial.c_str(), d.state.c_str(), d.transport.c_str());
     }
     if (devs.empty()) {
-        printf("[AUTO]   (порожньо — телефон не підключено по USB і не законекчено по Wi-Fi)\n");
+        printf("[AUTO]   (empty - phone not connected over USB and not connected over Wi-Fi)\n");
     }
 }
 
 // adb start-server (завжди безпечно викликати)
 inline bool EnsureAdbServer() {
     if (!CommandExists("adb")) {
-        printf("[AUTO] ERROR: 'adb' не знайдено в PATH.\n");
-        printf("[AUTO] Встановіть: winget install Google.PlatformTools\n");
+        printf("[AUTO] ERROR: 'adb' not found in PATH.\n");
+        printf("[AUTO] Install with: winget install Google.PlatformTools\n");
         return false;
     }
     ExecResult r = Exec("adb start-server");
@@ -248,11 +248,11 @@ inline bool EnsureAdbServer() {
 inline bool AdbTcpip(int port = 5555) {
     ExecResult r = Exec("adb tcpip " + std::to_string(port));
     if (!r.ok()) {
-        printf("[AUTO] adb tcpip не вдався. Можливо телефон не підключено по USB або не підтверджено RSA.\n");
+        printf("[AUTO] adb tcpip failed. Phone may not be connected over USB or RSA not confirmed.\n");
         return false;
     }
     // adbd рестартиться 3-5с — чекаємо довше (2с замало, connect висів до таймауту)
-    printf("[AUTO] Телефон переведено в tcpip :%d. Чекаю 4с поки adbd перезапуститься...\n", port);
+    printf("[AUTO] Phone switched to tcpip :%d. Waiting 4s for adbd to restart...\n", port);
     std::this_thread::sleep_for(std::chrono::seconds(4));
     return true;
 }
@@ -298,7 +298,7 @@ inline std::vector<std::string> DetectPhoneIps() {
         }
     }
     if (!out.empty()) {
-        printf("[AUTO] Кандидати на IP телефону:");
+        printf("[AUTO] Phone IP candidates:");
         for (auto& ip : out) printf(" %s", ip.c_str());
         printf("\n");
     }
@@ -327,28 +327,28 @@ inline bool TcpDeviceReady(const std::string& serial) {
 inline bool AdbConnect(const std::string& ip, int port = 5555, int attempts = 3) {
     std::string serial = ip + ":" + std::to_string(port);
     for (int i = 1; i <= attempts; ++i) {
-        printf("[AUTO] Спроба %d/%d: adb connect %s ...\n", i, attempts, serial.c_str());
+        printf("[AUTO] Attempt %d/%d: adb connect %s ...\n", i, attempts, serial.c_str());
         Exec("adb connect " + serial);
         for (int w = 0; w < 4; ++w) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (TcpDeviceReady(serial)) {
-                printf("[AUTO] Підключено і підтверджено: %s (device).\n", serial.c_str());
+                printf("[AUTO] Connected and confirmed: %s (device).\n", serial.c_str());
                 return true;
             }
         }
     }
-    printf("[AUTO] Не вдалося отримати device на %s за %d спроби.\n", serial.c_str(), attempts);
+    printf("[AUTO] Failed to get device on %s after %d attempts.\n", serial.c_str(), attempts);
     return false;
 }
 
 inline void DiagnoseConnectFail(const std::string& ip, int port) {
-    printf("\n[AUTO] ДІАГНОСТИКА: adb connect не вдався. Перевірте по пунктах:\n");
-    printf("[AUTO]   1. Телефон і ПК в ОДНІЙ Wi-Fi мережі? (IP %s має бути з вашої LAN, напр. 192.168.x.x)\n", ip.c_str());
-    printf("[AUTO]      Якщо IP схоже на мобільну підмережу (10.x) — увімкніть Wi-Fi на телефоні.\n");
-    printf("[AUTO]   2. На телефоні: Параметри -> Для розробників -> Бездротове налагодження УВІМКНЕНО?\n");
-    printf("[AUTO]   3. AP isolation в роутері вимкнено?\n");
-    printf("[AUTO]   4. Брандмауер Windows не ріже порт %d? Тест: ping %s\n", port, ip.c_str());
-    printf("[AUTO]   5. Або задайте IP вручну: --phone-ip <IP з Налаштування -> Про телефон -> Статус>\n\n");
+    printf("\n[AUTO] DIAGNOSTICS: adb connect failed. Check the following:\n");
+    printf("[AUTO]   1. Phone and PC on the SAME Wi-Fi network? (IP %s should be from your LAN, e.g. 192.168.x.x)\n", ip.c_str());
+    printf("[AUTO]      If the IP looks like a mobile subnet (10.x) - enable Wi-Fi on the phone.\n");
+    printf("[AUTO]   2. On the phone: Settings -> Developer options -> Wireless debugging ENABLED?\n");
+    printf("[AUTO]   3. AP isolation disabled on the router?\n");
+    printf("[AUTO]   4. Windows firewall not blocking port %d? Test: ping %s\n", port, ip.c_str());
+    printf("[AUTO]   5. Or set the IP manually: --phone-ip <IP from Settings -> About phone -> Status>\n\n");
 }
 
 // ============================================================================
@@ -599,10 +599,10 @@ inline std::vector<std::string> ScanLanForAdb(int port = 5555, int timeout_ms = 
     std::vector<std::string> targets = GetLanScanTargets();
     std::vector<std::string> open;
     if (targets.empty()) {
-        printf("[AUTO] LAN-сканування: не вдалося визначити локальну підмережу.\n");
+        printf("[AUTO] LAN scan: failed to determine the local subnet.\n");
         return open;
     }
-    printf("[AUTO] Сканую мережу (%zu адрес, порт %d)... це займе кілька секунд.\n",
+    printf("[AUTO] Scanning the network (%zu addresses, port %d)... this will take a few seconds.\n",
            targets.size(), port);
     std::mutex m;
     std::atomic<size_t> idx(0);
@@ -625,12 +625,12 @@ inline std::vector<std::string> ScanLanForAdb(int port = 5555, int timeout_ms = 
         return IpStrToU32(a) < IpStrToU32(b);
     });
     if (!open.empty()) {
-        printf("[AUTO] Відкритий порт %d знайдено на:", port);
+        printf("[AUTO] Open port %d found on:", port);
         for (size_t i = 0; i < open.size(); ++i) printf(" %s", open[i].c_str());
         printf("\n");
     } else {
-        printf("[AUTO] Нічого з відкритим портом %d не знайдено.\n", port);
-        printf("[AUTO] Підказка: увімкніть Бездротове налагодження або виконайте 'adb tcpip 5555' по USB.\n");
+        printf("[AUTO] Nothing with open port %d found.\n", port);
+        printf("[AUTO] Hint: enable Wireless debugging or run 'adb tcpip 5555' over USB.\n");
     }
     return open;
 }
@@ -676,11 +676,11 @@ inline LanDevice GetLanDeviceInfo(const std::string& ip, int port = 5555) {
     if (!manuf.empty() || !model.empty()) d.name = TrimStr(manuf + " " + model);
     else if (!devname.empty() && devname != "null") d.name = devname;
     else if (!dev.empty()) d.name = dev;
-    else d.name = u8"невідома модель";
+    else d.name = u8"unknown model";
     if (!android.empty()) d.name += " (Android " + android + ")";
-    if (d.state == "unauthorized") d.name += u8" [потрібно підтвердити RSA на екрані]";
+    if (d.state == "unauthorized") d.name += u8" [RSA confirmation required on the screen]";
     else if (d.state == "offline") d.name += " [offline]";
-    else if (d.state.empty()) d.name += u8" [не відповідає на ADB — можливо не телефон]";
+    else if (d.state.empty()) d.name += u8" [not responding to ADB - may not be a phone]";
     return d;
 }
 
@@ -689,7 +689,7 @@ inline std::vector<LanDevice> ScanLanWithNames(int port = 5555, int timeout_ms =
     std::vector<std::string> ips = ScanLanForAdb(port, timeout_ms);
     for (size_t i = 0; i < ips.size(); ++i) {
         LanDevice d = GetLanDeviceInfo(ips[i], port);
-        printf("[AUTO]   - %s — %s\n", d.serial.c_str(), d.name.c_str());
+        printf("[AUTO]   - %s - %s\n", d.serial.c_str(), d.name.c_str());
         out.push_back(d);
     }
     return out;
@@ -712,11 +712,11 @@ inline bool StdinInteractive() {
 // Показати "IP — назва" і попросити вибрати. Повертає IP або "".
 inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, const std::string& pick = "") {
     if (devs.empty()) return "";
-    printf("\n[AUTO] Знайдено пристроїв у мережі: %zu. До якого приєднатись?\n", devs.size());
+    printf("\n[AUTO] Found %zu device(s) on the network. Which one to join?\n", devs.size());
     for (size_t i = 0; i < devs.size(); ++i) {
-        printf("[AUTO]   %zu. %s — %s\n", i + 1, devs[i].serial.c_str(), devs[i].name.c_str());
+        printf("[AUTO]   %zu. %s - %s\n", i + 1, devs[i].serial.c_str(), devs[i].name.c_str());
     }
-    printf("[AUTO]   0. Пропустити (демо без телефону)\n\n");
+    printf("[AUTO]   0. Skip (demo without phone)\n\n");
     if (!pick.empty()) {
         std::string p = TrimStr(pick);
         std::string chosen;
@@ -731,15 +731,15 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
             }
         }
         if (!chosen.empty()) {
-            printf("[AUTO] Автовибір (--pick %s): %s.\n", p.c_str(), chosen.c_str());
+            printf("[AUTO] Auto-select (--pick %s): %s.\n", p.c_str(), chosen.c_str());
             AdbDisconnectOthers(devs, chosen);
             return chosen;
         }
-        printf("[AUTO] --pick=%s ні з чим не збігся, питаю вручну...\n", p.c_str());
+        printf("[AUTO] --pick=%s matched nothing, asking manually...\n", p.c_str());
     }
     if (!StdinInteractive()) {
         if (devs.size() == 1) {
-            printf("[AUTO] Неінтерактивний режим — беру єдиний пристрій %s автоматично.\n", devs[0].ip.c_str());
+            printf("[AUTO] Non-interactive mode - taking the only device %s automatically.\n", devs[0].ip.c_str());
             return devs[0].ip;
         }
         for (size_t i = 0; i < devs.size(); ++i) {
@@ -750,17 +750,17 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
         }
         return "";
     }
-    printf("Введіть номер (1-%zu), IP, або 0/Enter щоб пропустити: ", devs.size());
+    printf("Enter number (1-%zu), IP, or 0/Enter to skip: ", devs.size());
     fflush(stdout);
     char buf[256] = {0};
     if (!fgets(buf, sizeof(buf), stdin)) {
-        printf("\n[AUTO] Вибір скасовано.\n");
+        printf("\n[AUTO] Selection cancelled.\n");
         AdbDisconnectOthers(devs, "");
         return "";
     }
     std::string ans = TrimStr(buf);
     if (ans.empty() || ans == "0") {
-        printf("[AUTO] Пропущено за вибором користувача.\n");
+        printf("[AUTO] Skipped by user choice.\n");
         AdbDisconnectOthers(devs, "");
         return "";
     }
@@ -768,7 +768,7 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
     if (numeric) {
         int idx = atoi(ans.c_str());
         if (idx >= 1 && idx <= (int)devs.size()) {
-            printf("[AUTO] Вибрано: %s — %s.\n", devs[idx - 1].serial.c_str(), devs[idx - 1].name.c_str());
+            printf("[AUTO] Selected: %s - %s.\n", devs[idx - 1].serial.c_str(), devs[idx - 1].name.c_str());
             AdbDisconnectOthers(devs, devs[idx - 1].ip);
             return devs[idx - 1].ip;
         }
@@ -777,7 +777,7 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
     }
     for (size_t i = 0; i < devs.size(); ++i) {
         if (devs[i].ip == ans || devs[i].serial == ans) {
-            printf("[AUTO] Вибрано: %s — %s.\n", devs[i].serial.c_str(), devs[i].name.c_str());
+            printf("[AUTO] Selected: %s - %s.\n", devs[i].serial.c_str(), devs[i].name.c_str());
             AdbDisconnectOthers(devs, devs[i].ip);
             return devs[i].ip;
         }
@@ -785,7 +785,7 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
     // Дозволяємо IP вручну навіть якщо сканер його не бачив
     int a, b, c, d;
     if (sscanf(ans.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
-        printf("[AUTO] Введено IP вручну: %s (його не було в скані, спробую підключитись).\n", ans.c_str());
+        printf("[AUTO] IP entered manually: %s (not in the scan, trying to connect).\n", ans.c_str());
         AdbDisconnectOthers(devs, "");
         return ans;
     }
@@ -802,7 +802,7 @@ inline std::string InteractivePickDevice(const std::vector<LanDevice>& devs, con
 
 // Виконати команду, подавши рядок на stdin (для 'adb pair', що питає код).
 inline int ExecWithInput(const std::string& cmd, const std::string& input) {
-    LogCmd(cmd + "  (< код парування через stdin)");
+    LogCmd(cmd + "  (< pairing code via stdin)");
 #ifdef _WIN32
     FILE* pipe = _popen(cmd.c_str(), "w");
 #else
@@ -821,13 +821,13 @@ inline int ExecWithInput(const std::string& cmd, const std::string& input) {
 
 inline bool WirelessPair(const std::string& ip, int pair_port, const std::string& code) {
     std::string serial = ip + ":" + std::to_string(pair_port);
-    printf("[AUTO] adb pair %s (код з екрану телефону)...\n", serial.c_str());
+    printf("[AUTO] adb pair %s (code from the phone screen)...\n", serial.c_str());
     int rc = ExecWithInput("adb pair " + serial, code);
     if (rc == 0) {
-        printf("[AUTO] Парування вдалося (код прийнято).\n");
+        printf("[AUTO] Pairing succeeded (code accepted).\n");
         return true;
     }
-    printf("[AUTO] Парування НЕ вдалося (rc=%d). Код одноразовий — відкрийте екран заново.\n", rc);
+    printf("[AUTO] Pairing FAILED (rc=%d). The code is one-time - reopen the screen.\n", rc);
     return false;
 }
 
@@ -835,20 +835,20 @@ inline bool WirelessPair(const std::string& ip, int pair_port, const std::string
 // Повертає "ip:connect_port" або "". Код з --pair-code підставляється замість вводу.
 inline std::string TryWirelessPairingInput(const std::string& pair_code = "") {
     if (!StdinInteractive() && pair_code.empty()) return "";
-    printf("\n[AUTO] БЕЗ КАБЕЛЮ (Android 11+): на телефоні увімкніть\n");
-    printf("[AUTO]   Параметри -> Для розробників -> Бездротове налагодження,\n");
-    printf("[AUTO]   відкрийте 'Pair device with pairing code'.\n");
+    printf("\n[AUTO] WITHOUT CABLE (Android 11+): enable on the phone\n");
+    printf("[AUTO]   Settings -> Developer options -> Wireless debugging,\n");
+    printf("[AUTO]   open 'Pair device with pairing code'.\n");
     if (pair_code.empty())
-        printf("[AUTO] Введіть: IP pair_port code connect_port\n");
+        printf("[AUTO] Enter: IP pair_port code connect_port\n");
     else
-        printf("[AUTO] Введіть: IP pair_port connect_port (код візьму з --pair-code)\n");
-    printf("[AUTO] (напр.: 192.168.1.50 39511 482906 37123; порожньо = пропустити): ");
+        printf("[AUTO] Enter: IP pair_port connect_port (taking code from --pair-code)\n");
+    printf("[AUTO] (e.g.: 192.168.1.50 39511 482906 37123; empty = skip): ");
     fflush(stdout);
     char buf[256] = {0};
     if (!fgets(buf, sizeof(buf), stdin)) return "";
     std::string line = TrimStr(buf);
     if (line.empty()) {
-        printf("[AUTO] Пропущено.\n");
+        printf("[AUTO] Skipped.\n");
         return "";
     }
     std::istringstream ss(line);
@@ -860,14 +860,14 @@ inline std::string TryWirelessPairingInput(const std::string& pair_code = "") {
     else if (!t3.empty()) {
         // 3 токени без прапорця: IP pair_port connect_port — код запитаємо окремо
         s_conn = t3;
-        printf("[AUTO] Введіть 6-значний код з екрану телефону: ");
+        printf("[AUTO] Enter the 6-digit code from the phone screen: ");
         fflush(stdout);
         char cb[64] = {0};
         if (fgets(cb, sizeof(cb), stdin)) code = TrimStr(cb);
     }
     int a, b, c, d;
     if (sscanf(ip.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
-        printf("[AUTO] Схоже не на IP — пропускаю.\n");
+        printf("[AUTO] Does not look like an IP - skipping.\n");
         return "";
     }
     int pair_port = atoi(s_pair.c_str());
@@ -875,10 +875,10 @@ inline std::string TryWirelessPairingInput(const std::string& pair_code = "") {
     if (pair_port > 0 && !code.empty()) {
         if (!WirelessPair(ip, pair_port, code)) return "";
     } else if (pair_port > 0) {
-        printf("[AUTO] Коду нема — пропускаю парування, пробую одразу підключитись.\n");
+        printf("[AUTO] No code - skipping pairing, trying to connect directly.\n");
     }
     if (conn_port <= 0) {
-        printf("[AUTO] Без порту підключення ('IP address & Port') ніяк — пропускаю.\n");
+        printf("[AUTO] Without the connection port ('IP address & Port') cannot proceed - skipping.\n");
         return "";
     }
     if (AdbConnect(ip, conn_port)) return ip + ":" + std::to_string(conn_port);
@@ -911,15 +911,15 @@ inline std::string AutoSetupPhoneWifi(int port = 5555, bool allow_scan = true,
         if (devs[i].is_tcp() && devs[i].state == "device") { already = devs[i].serial; break; }
     }
     if (!already.empty() && !force_scan) {
-        printf("[AUTO] Вже є Wi-Fi пристрій: %s — пропускаємо tcpip.\n", already.c_str());
+        printf("[AUTO] Wi-Fi device already present: %s - skipping tcpip.\n", already.c_str());
         return already;
     }
     if (!already.empty() && force_scan && allow_scan) {
-        printf("[AUTO] Примусове сканування (--scan): вже підключено %s, але дивлюсь всі IP в мережі...\n",
+        printf("[AUTO] Forced scan (--scan): already connected %s, but checking all IPs on the network...\n",
                already.c_str());
         std::string r = TryLanScanPick(port, scan_timeout_ms, pick);
         if (!r.empty()) return r;
-        printf("[AUTO] Залишаю вже підключений %s.\n", already.c_str());
+        printf("[AUTO] Keeping already connected %s.\n", already.c_str());
         return already;
     }
     // Чи є USB пристрій?
@@ -928,39 +928,39 @@ inline std::string AutoSetupPhoneWifi(int port = 5555, bool allow_scan = true,
         if (!devs[i].is_tcp() && devs[i].state == "device") { has_usb = true; break; }
     }
     if (!has_usb) {
-        printf("[AUTO] USB-пристрій не знайдено.");
+        printf("[AUTO] USB device not found.");
         // Кабелю нема — СПОЧАТКУ пробуємо взагалі БЕЗ кабелю (Бездротове налагодження),
         // потім класичний скан порту 5555.
         if (allow_scan) {
             printf("\n");
             std::string w = TryWirelessPairingInput(pair_code);
             if (!w.empty()) return w;
-            printf("[AUTO] Дивлюсь усі доступні IP-адреси в мережі...\n");
+            printf("[AUTO] Checking all available IP addresses on the network...\n");
             std::string r = TryLanScanPick(port, scan_timeout_ms, pick);
             if (!r.empty()) return r;
-            printf("[AUTO] У мережі нічого придатного не вибрано.\n");
+            printf("[AUTO] Nothing suitable selected on the network.\n");
         } else {
-            printf(" (мережевий пошук вимкнено --no-scan).\n");
+            printf(" (network search disabled with --no-scan).\n");
         }
         return "";
     }
     // КРОК 1: IP — ДО tcpip, поки USB живий (після рестарту adbd 'adb shell' вже не працює
     // і можна схопити сміття на кшталт шлюзу мобільної підмережі).
-    printf("[AUTO] Визначаю IP телефону ДО перезапуску adbd (поки USB живий)...\n");
+    printf("[AUTO] Detecting phone IP BEFORE adbd restart (while USB is alive)...\n");
     auto candidates = DetectPhoneIps();
-    printf("[AUTO] Знайдено USB-пристрій, перемикаємо в Wi-Fi (tcpip %d)...\n", port);
+    printf("[AUTO] USB device found, switching to Wi-Fi (tcpip %d)...\n", port);
     if (!AdbTcpip(port)) return "";
     if (candidates.empty()) {
-        printf("[AUTO] До tcpip IP не визначився — пробую ще раз (може не вийти, USB вже мертвий)...\n");
+        printf("[AUTO] IP was not detected before tcpip - retrying (may fail, USB already dead)...\n");
         candidates = DetectPhoneIps();
     }
     if (candidates.empty()) {
-        printf("[AUTO] Не визначив IP через USB. Дивлюсь усі доступні IP-адреси в мережі...\n");
+        printf("[AUTO] Could not detect IP over USB. Checking all available IP addresses on the network...\n");
         if (allow_scan) {
             std::string r = TryLanScanPick(port, scan_timeout_ms, pick);
             if (!r.empty()) return r;
         }
-        printf("[AUTO] Не вдалося визначити IP. Введіть вручну або передайте --phone-ip.\n");
+        printf("[AUTO] Failed to detect IP. Enter it manually or pass --phone-ip.\n");
         return "";
     }
     // КРОК 2: пробуємо КОЖНОГО кандидата з перевіркою
@@ -969,7 +969,7 @@ inline std::string AutoSetupPhoneWifi(int port = 5555, bool allow_scan = true,
     }
     DiagnoseConnectFail(candidates[0], port);
     if (allow_scan) {
-        printf("[AUTO] USB-кандидати не підійшли. Дивлюсь усі доступні IP-адреси в мережі...\n");
+        printf("[AUTO] USB candidates did not work. Checking all available IP addresses on the network...\n");
         std::string r = TryLanScanPick(port, scan_timeout_ms, pick);
         if (!r.empty()) return r;
     }
@@ -988,7 +988,7 @@ inline bool CheckVhciPresent() {
                            OPEN_EXISTING, 0, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
         CloseHandle(h);
-        printf("[AUTO] VHCI драйвер знайдено (\\\\.\\vhci).\n");
+        printf("[AUTO] VHCI driver found (\\\\.\\vhci).\n");
         return true;
     }
     HANDLE h2 = CreateFileW(L"\\\\.\\USBIP_VHCI", GENERIC_READ | GENERIC_WRITE,
@@ -996,11 +996,11 @@ inline bool CheckVhciPresent() {
                             OPEN_EXISTING, 0, nullptr);
     if (h2 != INVALID_HANDLE_VALUE) {
         CloseHandle(h2);
-        printf("[AUTO] VHCI драйвер знайдено (\\\\.\\USBIP_VHCI).\n");
+        printf("[AUTO] VHCI driver found (\\\\.\\USBIP_VHCI).\n");
         return true;
     }
-    printf("[AUTO] VHCI драйвер НЕ знайдено. Працюємо в SIMULATION режимі.\n");
-    printf("[AUTO] Для справжнього USB: встановіть usbip-win2 (див. scripts/setup_windows.ps1) і запустіть з --vhci\n");
+    printf("[AUTO] VHCI driver NOT found. Running in SIMULATION mode.\n");
+    printf("[AUTO] For real USB: install usbip-win2 (see scripts/setup_windows.ps1) and run with --vhci\n");
     return false;
 #else
     ExecResult r = Exec("ls /dev/vhci 2>&1", true);
@@ -1014,8 +1014,8 @@ inline void CheckTestSigning() {
     if (r.output.find("Yes") != std::string::npos || r.output.find("testsigning          Yes") != std::string::npos) {
         printf("[AUTO] Test Signing: ON.\n");
     } else {
-        printf("[AUTO] Test Signing: OFF або невідомо (потрібно для usbip-win2 без EV-сертифіката).\n");
-        printf("[AUTO] Увімкнути (потрібні права адміна): bcdedit /set testsigning on  + перезавантаження\n");
+        printf("[AUTO] Test Signing: OFF or unknown (required for usbip-win2 without EV certificate).\n");
+        printf("[AUTO] Enable (admin rights required): bcdedit /set testsigning on + reboot\n");
     }
 #endif
 }
@@ -1026,7 +1026,7 @@ inline void CheckTestSigning() {
 
 inline bool CheckScrcpy() {
     if (!CommandExists("scrcpy")) {
-        printf("[AUTO] 'scrcpy' не знайдено в PATH. Встановіть: winget install Genymobile.scrcpy\n");
+        printf("[AUTO] 'scrcpy' not found in PATH. Install with: winget install Genymobile.scrcpy\n");
         return false;
     }
     Exec("scrcpy --version", true);
@@ -1037,7 +1037,7 @@ inline bool CheckScrcpy() {
 inline bool LaunchScrcpy(const std::string& extra_args = "--select-usb") {
     if (!CheckScrcpy()) return false;
     std::string cmd = "scrcpy " + extra_args;
-    printf("[AUTO] Запускаємо scrcpy автоматично...\n");
+    printf("[AUTO] Launching scrcpy automatically...\n");
     return LaunchDetached(cmd);
 }
 
@@ -1047,7 +1047,7 @@ inline bool LaunchScrcpy(const std::string& extra_args = "--select-usb") {
 
 inline bool CheckCmake() {
     if (!CommandExists("cmake")) {
-        printf("[AUTO] 'cmake' не знайдено. Встановіть: winget install Kitware.CMake\n");
+        printf("[AUTO] 'cmake' not found. Install with: winget install Kitware.CMake\n");
         return false;
     }
     return true;

@@ -445,15 +445,15 @@ void print_usage(const char* prog) {
     printf("  --server <host:port>  Sender address (default 127.0.0.1:22777)\n");
     printf("  --vhci                Try to use real vhci.sys (requires usbip-win2)\n");
     printf("  --simulate            Simulate ADB handshake without real device\n");
-    printf("  --auto                САМ вводить всі команди: adb start-server, перевірка vhci,\n");
-    printf("                        adb devices, автозапуск scrcpy. Нічого вводити вручну не треба.\n");
-    printf("  --no-scrcpy           Не запускати scrcpy автоматично (навіть з --auto)\n");
-    printf("  --scrcpy-args \"...\"   Аргументи для scrcpy (default \"--select-usb\")\n");
-    printf("  --jitter-ms <N>       Jitter-буфер в мс (default 30; на хотспоті/повільному Wi-Fi 60-100)\n");
+    printf("  --auto                Automatically runs all commands: adb start-server, vhci check,\n");
+    printf("                        adb devices, scrcpy autostart. No manual input needed.\n");
+    printf("  --no-scrcpy           Do not launch scrcpy automatically (even with --auto)\n");
+    printf("  --scrcpy-args \"...\"   Arguments for scrcpy (default \"--select-usb\")\n");
+    printf("  --jitter-ms <N>       Jitter buffer in ms (default 30; on hotspot/slow Wi-Fi 60-100)\n");
     printf("  --help                Show this help\n");
     printf("\nExamples:\n");
-    printf("  %s --auto --simulate                      (демо без телефону, все само)\n", prog);
-    printf("  %s --auto --vhci --server 192.168.1.100:22777  (реальний телефон + драйвер)\n", prog);
+    printf("  %s --auto --simulate                      (demo without phone, all automatic)\n", prog);
+    printf("  %s --auto --vhci --server 192.168.1.100:22777  (real phone + driver)\n", prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -502,32 +502,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("=== Virtual USB Cable — Agent-Receiver (Windows) ===\n");
+    printf("=== Virtual USB Cable - Agent-Receiver (Windows) ===\n");
     printf("Server: %s:%u  VHCI: %s  Simulate: %s  Auto: %s  Jitter: %ums\n",
            server_host, server_port, use_vhci ? "yes" : "no", simulate ? "yes" : "no",
            auto_mode ? "yes" : "no", g_jitter_ms);
 
     // --- AUTO: сам вводимо всі команди ---
     if (auto_mode) {
-        printf("\n[AUTO] ===== Авторежим: сам виконую всі команди =====\n");
+        printf("\n[AUTO] ===== Auto mode: running all commands automatically =====\n");
         autosetup::EnsureAdbServer();
         autosetup::CheckTestSigning();
         bool vhci_ok = autosetup::CheckVhciPresent();
         if (use_vhci && !vhci_ok) {
-            printf("[AUTO] --vhci запитано, але драйвер не знайдено. Продовжую в SIMULATION.\n");
-            printf("[AUTO] Встановіть драйвер: powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1\n");
+            printf("[AUTO] --vhci requested but driver not found. Continuing in SIMULATION.\n");
+            printf("[AUTO] Install the driver: powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1\n");
         }
         if (!use_vhci && vhci_ok) {
-            printf("[AUTO] Драйвер є, але --vhci не передано. Вмикаю --vhci автоматично.\n");
+            printf("[AUTO] Driver found but --vhci not passed. Enabling --vhci automatically.\n");
             use_vhci = true;
         }
         if (!simulate) {
             // В авторежимі без реального телефону краще симулювати handshake,
             // щоб scrcpy хоч щось побачив. Реальний handshake прийде з мережі сам.
-            printf("[AUTO] Перевіряю adb devices перед підключенням...\n");
+            printf("[AUTO] Checking adb devices before connecting...\n");
             autosetup::PrintAdbDevices();
         }
-        printf("[AUTO] ===== Автонастройка завершена, підключаюсь =====\n\n");
+        printf("[AUTO] ===== Auto-setup finished, connecting =====\n\n");
     }
 
     // Ініціалізуємо VHCI
@@ -546,7 +546,7 @@ int main(int argc, char* argv[]) {
             g_vhci.start_completion_thread();
         }
     } else {
-        printf("[MAIN] VHCI disabled — running in network-only mode (no Device Manager device)\n");
+        printf("[MAIN] VHCI disabled - running in network-only mode (no Device Manager device)\n");
         printf("[MAIN] Use --vhci to create real USB device (requires usbip-win2 driver)\n");
     }
 
@@ -578,22 +578,22 @@ int main(int argc, char* argv[]) {
     if (auto_mode) {
         // AUTO: сам перевіряємо adb і сам запускаємо scrcpy — користувач нічого не вводить
         std::this_thread::sleep_for(std::chrono::milliseconds(800));
-        printf("\n[AUTO] ===== Перевірка результату =====\n");
+        printf("\n[AUTO] ===== Checking the result =====\n");
         autosetup::PrintAdbDevices();
         if (auto_scrcpy) {
             // Невелика пауза щоб vhci пристрій встиг з'явитися в Device Manager
             std::this_thread::sleep_for(std::chrono::milliseconds(700));
             if (!autosetup::LaunchScrcpy(scrcpy_args)) {
-                printf("[AUTO] Не вдалося запустити scrcpy автоматично. Запустіть вручну: scrcpy %s\n", scrcpy_args.c_str());
+                printf("[AUTO] Failed to launch scrcpy automatically. Run manually: scrcpy %s\n", scrcpy_args.c_str());
             }
         } else {
-            printf("[AUTO] --no-scrcpy: scrcpy не запускаю. Команда вручну: scrcpy %s\n", scrcpy_args.c_str());
+            printf("[AUTO] --no-scrcpy: not launching scrcpy. Manual command: scrcpy %s\n", scrcpy_args.c_str());
         }
-        printf("[AUTO] ===== Все готово, працюю. Ctrl+C щоб зупинити =====\n\n");
+        printf("[AUTO] ===== All ready, running. Ctrl+C to stop =====\n\n");
     } else {
-        printf("[MAIN] Check 'adb devices' — should show device as USB (if --vhci)\n");
+        printf("[MAIN] Check 'adb devices' - should show device as USB (if --vhci)\n");
         printf("[MAIN] Run scrcpy: scrcpy --select-usb\n");
-        printf("[MAIN] Або запустіть з --auto щоб все зробилось само.\n");
+        printf("[MAIN] Or run with --auto to do everything automatically.\n");
     }
 
     // Головний цикл — чекаємо Ctrl+C
